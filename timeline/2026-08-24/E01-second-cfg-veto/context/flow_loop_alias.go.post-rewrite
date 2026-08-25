@@ -1,0 +1,386 @@
+package sqliteinventory
+
+import (
+	"go/ast"
+	"go/types"
+)
+
+type mutationCall struct {
+	caller      *functionInfo
+	binding     types.Object
+	target      callTarget
+	candidates  []mutationTarget
+	entry       map[string]bool
+	scope       *valueEnv
+	arena       *captureArena
+	arguments   []ast.Expr
+	actualRoots map[types.Object]map[types.Object]bool
+	prefix      map[string]pointSet
+	id          string
+}
+
+type mutationTarget struct {
+	target callTarget
+	scope  *valueEnv
+	arena  *captureArena
+}
+
+type pointSet struct {
+	targets  []mutationTarget
+	unknown  bool
+	forwards map[types.Object]bool
+}
+
+const maxPointTargets = 64
+
+func cloneTargets(source []mutationTarget) []mutationTarget {
+	return append([]mutationTarget(nil), source...)
+}
+
+func mergeTargets(left, right []mutationTarget) []mutationTarget {
+	result := cloneTargets(left)
+	for _, target := range right {
+		result = appendUniqueTarget(result, target)
+	}
+	return result
+}
+
+func mergePoints(left, right pointSet) pointSet {
+	result := pointSet{targets: mergeTargets(left.targets, right.targets), unknown: left.unknown || right.unknown, forwards: cloneObjectSet(left.forwards)}
+	for object := range right.forwards {
+		if result.forwards == nil {
+			result.forwards = make(map[types.Object]bool)
+		}
+		result.forwards[object] = true
+	}
+	if len(result.targets)+len(result.forwards) > maxPointTargets {
+		result.targets = nil
+		result.forwards = nil
+		result.unknown = true
+	}
+	return result
+}
+
+func currentPoint(env valueEnv, object types.Object) (pointSet, bool) {
+	if object == nil {
+		return pointSet{}, false
+	}
+	points, ok := env.points[object]
+	points = clonePointSet(points)
+	points.forwards = nil
+	return points, ok
+}
+
+func clonePointSet(source pointSet) pointSet {
+	source.targets = cloneTargets(source.targets)
+	source.forwards = cloneObjectSet(source.forwards)
+	return source
+}
+
+func resolvePointTargets(env valueEnv, object types.Object, seen map[types.Object]bool) ([]mutationTarget, bool) {
+	point, ok := currentPoint(env, object)
+	if !ok || point.unknown {
+		return nil, true
+	}
+	return cloneTargets(point.targets), false
+}
+
+func resolvePointMap(points map[types.Object]pointSet, object types.Object, seen map[types.Object]bool) ([]mutationTarget, bool) {
+	point, ok := points[object]
+	if !ok || object == nil {
+		return nil, true
+	}
+	if point.unknown {
+		return nil, true
+	}
+	result := cloneTargets(point.targets)
+	if len(point.forwards) > 0 {
+		if seen[object] {
+			return nil, true
+		}
+		seen[object] = true
+		for forward := range point.forwards {
+			targets, unknown := resolvePointMap(points, forward, seen)
+			if unknown {
+				delete(seen, object)
+				return nil, true
+			}
+			result = mergeTargets(result, targets)
+			if len(result) > maxPointTargets {
+				delete(seen, object)
+				return nil, true
+			}
+		}
+		delete(seen, object)
+	}
+	return result, false
+}
+
+func callableObject(object types.Object) bool {
+	if object == nil || object.Type() == nil {
+		return false
+	}
+	_, ok := object.Type().Underlying().(*types.Signature)
+	return ok
+}
+
+func currentAliasRoots(env valueEnv, object types.Object) map[types.Object]bool {
+	if object == nil || env.aliases == nil {
+		return nil
+	}
+	return cloneObjectSet(env.aliases[object])
+}
+
+func setAliasRoots(env *valueEnv, object, source types.Object) {
+	if env == nil || object == nil || source == nil {
+		return
+	}
+	if !mutableType(source.Type(), make(map[types.Type]bool)) {
+		clearAliasRoots(env, object)
+		return
+	}
+	if env.aliases == nil {
+		env.aliases = make(map[types.Object]map[types.Object]bool)
+	}
+	roots := currentAliasRoots(*env, source)
+	if len(roots) == 0 {
+		roots = map[types.Object]bool{source: true}
+	}
+	env.aliases[object] = roots
+}
+
+func clearAliasRoots(env *valueEnv, object types.Object) {
+	if env != nil && env.aliases != nil && object != nil {
+		delete(env.aliases, object)
+	}
+}
+
+func dropAliasObject(env *valueEnv, object types.Object) {
+	if env == nil || env.aliases == nil || object == nil {
+		return
+	}
+	delete(env.aliases, object)
+	for destination, roots := range env.aliases {
+		delete(roots, object)
+		if len(roots) == 0 {
+			delete(env.aliases, destination)
+		}
+	}
+}
+
+func (a *analyzer) updateAliasRoots(env *valueEnv, object types.Object, rhs ast.Expr) {
+	if env == nil || object == nil {
+		return
+	}
+	source, kind, ok := a.sequenceDerivation(rhs)
+	if ok && kind == sequenceDerivationAppend {
+		return
+	}
+	if !ok || (kind != sequenceDerivationDirect && kind != sequenceDerivationSlice) || source == nil {
+		clearAliasRoots(env, object)
+		return
+	}
+	// A direct assignment is a current alias only when the value itself can
+	// share mutable storage.  Strings, scalars, and function values are
+	// copied; retaining their historical source as an alias makes an
+	// unrelated later write poison the copied value.
+	if !a.mutableType(a.current, rhs) {
+		clearAliasRoots(env, object)
+		return
+	}
+	if sourceObject := a.bindingObject(source); sourceObject != nil {
+		setAliasRoots(env, object, sourceObject)
+		return
+	}
+	clearAliasRoots(env, object)
+}
+
+func (a *analyzer) sequenceAliasKnown(env valueEnv, object types.Object) bool {
+	for root := range currentAliasRoots(env, object) {
+		for name, sequence := range env.sequences {
+			binding := sequence.binding
+			if binding == nil {
+				binding = env.bindings[name]
+			}
+			if sameBinding(binding, root) && !sequence.unknown && sequence.domain != sequenceDomainMapZero {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cloneObjectSet(source map[types.Object]bool) map[types.Object]bool {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[types.Object]bool, len(source))
+	for object := range source {
+		result[object] = true
+	}
+	return result
+}
+
+func addAliasRoots(dst map[types.Object]map[types.Object]bool, object types.Object, roots map[types.Object]bool) {
+	if dst == nil || object == nil {
+		return
+	}
+	if len(roots) == 0 {
+		roots = map[types.Object]bool{object: true}
+	}
+	if dst[object] == nil {
+		dst[object] = make(map[types.Object]bool)
+	}
+	for root := range roots {
+		dst[object][root] = true
+	}
+}
+
+func cloneAliasRoots(source map[types.Object]map[types.Object]bool) map[types.Object]map[types.Object]bool {
+	if len(source) == 0 {
+		return make(map[types.Object]map[types.Object]bool)
+	}
+	result := make(map[types.Object]map[types.Object]bool, len(source))
+	for object, roots := range source {
+		result[object] = cloneObjectSet(roots)
+	}
+	return result
+}
+
+func (a *analyzer) updateValueDeps(env *valueEnv, object types.Object, rhs ast.Expr) {
+	if env == nil || object == nil {
+		return
+	}
+	if rhs == nil {
+		env.setValueDeps(object, nil)
+		return
+	}
+	dependencies, unknown := a.exprObjects(rhs)
+	if unknown || len(dependencies) == 0 {
+		env.setValueDeps(object, nil)
+		return
+	}
+	env.setValueDeps(object, dependencies)
+}
+
+func (e *valueEnv) setValueDeps(object types.Object, dependencies map[types.Object]bool) {
+	if e == nil || object == nil {
+		return
+	}
+	if e.valueDeps == nil {
+		e.valueDeps = make(map[types.Object]map[types.Object]bool)
+	}
+	if len(dependencies) == 0 {
+		delete(e.valueDeps, object)
+	} else {
+		e.valueDeps[object] = cloneObjectSet(dependencies)
+	}
+	if e.trace == nil {
+		return
+	}
+	for _, loop := range e.loopTokens {
+		token := e.trace.tokens[loop.key]
+		if token == nil {
+			continue
+		}
+		if len(dependencies) == 0 {
+			delete(token.valueDeps, object)
+		} else {
+			token.valueDeps[object] = cloneObjectSet(dependencies)
+		}
+	}
+}
+
+func depsClosure(dependencies map[types.Object]map[types.Object]bool, root types.Object) map[types.Object]bool {
+	result := make(map[types.Object]bool)
+	if root == nil {
+		return result
+	}
+	queue := []types.Object{root}
+	result[root] = true
+	for len(queue) > 0 {
+		object := queue[0]
+		queue = queue[1:]
+		for dependency := range dependencies[object] {
+			if dependency != nil && !result[dependency] {
+				result[dependency] = true
+				queue = append(queue, dependency)
+			}
+		}
+	}
+	return result
+}
+
+func dropValueDeps(env *valueEnv, object types.Object) {
+	if env == nil || object == nil {
+		return
+	}
+	delete(env.valueDeps, object)
+	if env.trace != nil {
+		for _, loop := range env.loopTokens {
+			if token := env.trace.tokens[loop.key]; token != nil {
+				delete(token.valueDeps, object)
+			}
+		}
+	}
+	for destination, dependencies := range env.valueDeps {
+		delete(dependencies, object)
+		if len(dependencies) == 0 {
+			delete(env.valueDeps, destination)
+		}
+	}
+}
+
+func (a *analyzer) callAliasRoots(env valueEnv, target callTarget, candidates []mutationTarget, arguments []ast.Expr) map[types.Object]map[types.Object]bool {
+	result := make(map[types.Object]map[types.Object]bool)
+	all := append([]mutationTarget(nil), candidates...)
+	if target.function != nil {
+		all = appendUniqueTarget(all, mutationTarget{target: target, scope: target.capture})
+	}
+	for _, candidate := range all {
+		function := candidate.target.function
+		if function == nil {
+			continue
+		}
+		offset := 0
+		if candidate.target.methodExpression {
+			offset = 1
+		}
+		for index := range function.Params {
+			argument := index + offset
+			if argument >= len(arguments) {
+				break
+			}
+			formal := a.paramObject(function, index)
+			actual := a.mutationObject(a.current, arguments[argument])
+			if formal == nil || actual == nil {
+				continue
+			}
+			roots := currentAliasRoots(env, actual)
+			if len(roots) == 0 {
+				roots = map[types.Object]bool{actual: true}
+			}
+			addAliasRoots(result, formal, roots)
+		}
+		receiver := a.receiverObject(function)
+		if receiver == nil {
+			continue
+		}
+		var expression ast.Expr
+		if candidate.target.methodExpression && len(arguments) > 0 {
+			expression = arguments[0]
+		} else {
+			expression = candidate.target.receiver
+		}
+		actual := a.mutationObject(a.current, expression)
+		if actual == nil {
+			continue
+		}
+		roots := currentAliasRoots(env, actual)
+		if len(roots) == 0 {
+			roots = map[types.Object]bool{actual: true}
+		}
+		addAliasRoots(result, receiver, roots)
+	}
+	return result
+}

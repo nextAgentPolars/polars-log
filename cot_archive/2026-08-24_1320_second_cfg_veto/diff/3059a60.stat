@@ -1,0 +1,50 @@
+commit 3059a60b25f636d0de5912fc41f3f0cd490bb502
+Author: HOSRookie <Liuxy1933@163.com>
+Date:   Mon Aug 24 17:30:28 2026 +0800
+
+    feat(sqliteinventory): add typed path effect transfer
+
+ internal/analysis/sqliteinventory/analyze.go       |   64 +-
+ internal/analysis/sqliteinventory/binding.go       |   77 +-
+ internal/analysis/sqliteinventory/call_readonly.go |   70 +
+ internal/analysis/sqliteinventory/calls.go         |   49 +-
+ internal/analysis/sqliteinventory/capture_arena.go |   68 +
+ internal/analysis/sqliteinventory/capture_copy.go  |  352 ++++
+ internal/analysis/sqliteinventory/capture_graph.go |  214 +++
+ .../sqliteinventory/capture_graph_budget_test.go   |  393 +++++
+ .../analysis/sqliteinventory/closure_effect.go     |  352 ++++
+ .../sqliteinventory/closure_effect_apply.go        |  286 ++++
+ .../sqliteinventory/closure_effect_transfer.go     |  332 ++++
+ .../analysis/sqliteinventory/closure_execute.go    |   82 +-
+ .../analysis/sqliteinventory/expression_receipt.go |    2 +-
+ internal/analysis/sqliteinventory/flow.go          |    7 +-
+ .../analysis/sqliteinventory/flow_assignment.go    |   91 +-
+ .../sqliteinventory/flow_constant_reachability.go  |    2 +-
+ internal/analysis/sqliteinventory/flow_control.go  |  111 +-
+ internal/analysis/sqliteinventory/flow_if.go       |   63 +
+ internal/analysis/sqliteinventory/flow_loop.go     |  335 ++++
+ .../analysis/sqliteinventory/flow_loop_alias.go    |  386 +++++
+ .../analysis/sqliteinventory/flow_loop_expr.go     |   84 +
+ .../analysis/sqliteinventory/flow_loop_points.go   |  344 ++++
+ .../analysis/sqliteinventory/flow_loop_trace.go    |  281 ++++
+ .../sqliteinventory/flow_loop_trace_budget.go      |  140 ++
+ .../sqliteinventory/flow_loop_trace_compare.go     |  174 ++
+ .../sqliteinventory/flow_loop_trace_context.go     |  257 +++
+ .../sqliteinventory/flow_loop_trace_core.go        |  246 +++
+ .../sqliteinventory/flow_loop_trace_events.go      |  223 +++
+ .../sqliteinventory/flow_loop_trace_live.go        |   33 +
+ .../sqliteinventory/flow_loop_trace_resolve.go     |  389 +++++
+ .../analysis/sqliteinventory/flow_loop_widen.go    |  344 ++++
+ .../analysis/sqliteinventory/flow_loop_write.go    |   19 +
+ internal/analysis/sqliteinventory/flow_range.go    |   17 +-
+ .../sqliteinventory/flow_range_assignment.go       |   12 +
+ internal/analysis/sqliteinventory/flow_scope.go    |   47 +-
+ .../analysis/sqliteinventory/flow_scope_test.go    |   33 +-
+ internal/analysis/sqliteinventory/lattice.go       |  259 ++-
+ internal/analysis/sqliteinventory/path_lineage.go  |   19 +
+ .../analysis/sqliteinventory/path_lineage_test.go  | 1727 ++++++++++++++++++++
+ .../analysis/sqliteinventory/scope_projection.go   |  249 +++
+ .../analysis/sqliteinventory/sequence_alias.go     |   91 +-
+ internal/analysis/sqliteinventory/sql.go           |    6 +-
+ internal/analysis/sqliteinventory/value_join.go    |  127 ++
+ 43 files changed, 8100 insertions(+), 357 deletions(-)

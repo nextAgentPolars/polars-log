@@ -1,0 +1,25 @@
+commit d39e014819e73b13602f55282bd8584cdf3bd1e2
+Author: HOSRookie <Liuxy1933@163.com>
+Date:   Mon Aug 24 18:48:17 2026 +0800
+
+    ci: add bounded repository preflight
+
+ .github/workflows/ci-backend.yml           |  33 +++
+ .github/workflows/ci-desktop.yml           |  29 ++-
+ .github/workflows/release.yml              | 175 +------------
+ AGENTS.md                                  |   2 +
+ Makefile                                   |  30 ++-
+ docs/DEVELOPMENT.md                        |   8 +
+ scripts/entrypoint_matrix.json             |  10 +
+ scripts/preflight_root.py                  | 180 +++++++++++++
+ scripts/root_preflight/__init__.py         |   1 +
+ scripts/root_preflight/common.py           | 231 +++++++++++++++++
+ scripts/root_preflight/release.py          | 238 +++++++++++++++++
+ scripts/root_preflight/repository.py       | 393 +++++++++++++++++++++++++++++
+ scripts/root_preflight/workflows.py        | 295 ++++++++++++++++++++++
+ scripts/tests/preflight_fixture.py         | 259 +++++++++++++++++++
+ scripts/tests/test_preflight_release.py    | 199 +++++++++++++++
+ scripts/tests/test_preflight_repository.py | 309 +++++++++++++++++++++++
+ scripts/tests/test_preflight_root.py       |  77 ++++++
+ scripts/tests/test_preflight_workflows.py  | 256 +++++++++++++++++++
+ 18 files changed, 2545 insertions(+), 180 deletions(-)

@@ -1,0 +1,175 @@
+package sqliteinventory
+
+import (
+	"go/ast"
+)
+
+func (a *analyzer) scanBlock(block *ast.BlockStmt, env valueEnv) blockResult {
+	if block == nil || len(block.List) == 0 {
+		return blockResult{exits: []typedExit{normalExit(env)}}
+	}
+	frame := a.openScope(env, block.List)
+	result := a.scanBlockBody(block, frame.active, frame)
+	if a != nil && a.current != nil && block == a.current.Body {
+		result = a.drainDefers(result)
+	}
+	return a.projectScope(frame, result)
+}
+
+func (a *analyzer) scanBlockBody(block *ast.BlockStmt, env valueEnv, frame scopeFrame) blockResult {
+	if block == nil || len(block.List) == 0 {
+		return blockResult{exits: []typedExit{normalExit(env)}}
+	}
+	active := []typedExit{normalExit(env)}
+	for _, statement := range block.List {
+		next := make([]typedExit, 0, len(active))
+		for _, entry := range active {
+			if entry.kind != exitNormal {
+				next = append(next, entry)
+				continue
+			}
+			next = append(next, a.scanStmt(statement, entry.env).exits...)
+		}
+		for index := range next {
+			if next[index].kind == exitNormal {
+				next[index].env = a.detachScope(frame, next[index].env)
+			}
+		}
+		active = mergeTypedExits(next, a.limit())
+		if !hasNormalExit(active) {
+			break
+		}
+	}
+	return blockResult{exits: active}
+}
+
+func (a *analyzer) scanStmt(statement ast.Stmt, env valueEnv) blockResult {
+	if statement == nil {
+		return blockResult{exits: []typedExit{normalExit(env)}}
+	}
+	switch value := statement.(type) {
+	case *ast.BlockStmt:
+		return a.scanBlock(value, env)
+	case *ast.ExprStmt:
+		if call, ok := unwrapParen(value.X).(*ast.CallExpr); !ok || !a.readOnlyCall(call, env) && !a.dynamicCallManaged(call, env) {
+			a.invalidateSequenceEscape(&env, nil, value.X)
+		}
+		call, isCall := unwrapParen(value.X).(*ast.CallExpr)
+		if isCall && a.builtinPanic(call) {
+			a.evalReceipt(call, env)
+			return blockResult{exits: []typedExit{panicExit(env, call)}}
+		}
+		if isCall && a.directGoexitCall(call) {
+			a.evalReceipt(call, env)
+			return blockResult{exits: []typedExit{goexitExit(env, call)}}
+		}
+		receipt := a.evalControlReceipt(value.X, env)
+		if receipt.abrupt != "" {
+			return receiptResult(receipt, env, env, value)
+		}
+		applyReceiptEnv(&env, receipt)
+		if isCall && indirectGoexitTarget(receipt.calledTarget) {
+			a.addDiagnostic("goexit_indirect_unsupported", "indirect runtime.Goexit call is unsupported", call)
+			return blockResult{exits: []typedExit{opaqueExit(env, call, "indirect runtime.Goexit terminates unknown path")}}
+		}
+	case *ast.DeclStmt:
+		before := env
+		a.recordDecl(value, &env)
+		if receipt := a.scanDecl(value, &env); receipt.abrupt != "" {
+			return receiptResult(receipt, before, env, value)
+		}
+	case *ast.AssignStmt:
+		before := env
+		a.recordAssignment(value, &env)
+		if receipt := a.scanAssign(value, &env); receipt.abrupt != "" {
+			return receiptResult(receipt, before, env, value)
+		}
+	case *ast.ReturnStmt:
+		return a.scanReturn(value, env)
+	case *ast.IfStmt:
+		return a.scanIf(value, env)
+	case *ast.ForStmt:
+		return a.scanFor(value, env, nil)
+	case *ast.RangeStmt:
+		return a.scanRange(value, env, nil)
+	case *ast.SwitchStmt:
+		return a.scanSwitch(value, env, nil)
+	case *ast.TypeSwitchStmt:
+		return a.scanTypeSwitch(value, env, nil)
+	case *ast.GoStmt:
+		if receipt := a.evalScheduledReceipt(value.Call, env); receipt.abrupt != "" {
+			return receiptResult(receipt, env, env, value)
+		}
+	case *ast.DeferStmt:
+		before := env
+		if receipt := a.registerDefer(value, &env); receipt.abrupt != "" {
+			return receiptResult(receipt, before, env, value)
+		}
+	case *ast.IncDecStmt:
+		env.recordWrite(a.current, value.X)
+		a.invalidateNumericBranchTarget(&env, value.X)
+		a.invalidateSequenceTarget(&env, value.X)
+	case *ast.SendStmt:
+		a.invalidateSequenceEscape(&env, nil, value.Value)
+		a.evalExpr(value.Value, env)
+	case *ast.LabeledStmt:
+		return a.scanLabeled(value, env)
+	case *ast.BranchStmt:
+		return a.scanBranch(value, env)
+	case *ast.SelectStmt:
+		return blockResult{exits: []typedExit{a.reportOpaque(env, value, "select control flow is unsupported")}}
+	case *ast.EmptyStmt:
+		return blockResult{exits: []typedExit{normalExit(env)}}
+	default:
+		return blockResult{exits: []typedExit{a.reportOpaque(env, statement, "unsupported statement control flow")}}
+	}
+	return blockResult{exits: []typedExit{normalExit(env)}}
+}
+
+func receiptResult(receipt evalReceipt, before, after valueEnv, site ast.Node) blockResult {
+	if receipt.normal != nil {
+		after = receipt.normal.clone()
+	}
+	if receipt.abrupt == "" {
+		return blockResult{exits: []typedExit{normalExit(after)}}
+	}
+	if receipt.failed != nil {
+		before = receipt.failed.clone()
+	}
+	origin := receipt.origin
+	if origin == nil {
+		origin = site
+	}
+	exits := []typedExit{{kind: receipt.abrupt, env: before, origin: origin, reason: receipt.reason}}
+	if !receipt.stops {
+		exits = append(exits, normalExit(after))
+	}
+	return blockResult{exits: exits}
+}
+
+func sequenceAssignmentPreservesTarget(a *analyzer, lhs *ast.Ident, rhs ast.Expr) bool {
+	if lhs == nil || rhs == nil {
+		return false
+	}
+	rhs = unwrapParen(rhs)
+	if rhsIdent, ok := rhs.(*ast.Ident); ok {
+		return sameTypedIdent(a, lhs, rhsIdent)
+	}
+	call, ok := rhs.(*ast.CallExpr)
+	if !ok || callName(call.Fun) != "append" || len(call.Args) == 0 || !isBuiltinAppend(a, call.Fun) {
+		return false
+	}
+	base, ok := unwrapParen(call.Args[0]).(*ast.Ident)
+	return ok && sameTypedIdent(a, lhs, base)
+}
+
+func invalidateSequenceBinding(env *valueEnv, name string, sequence sequenceState) {
+	invalidateDependentSequenceValues(env, sequence)
+	delete(env.sequences, name)
+	delete(env.lists, name)
+	delete(env.structLists, name)
+	if sequence.id != "" {
+		delete(env.guards, sequence.id)
+		delete(env.branchGuards, sequence.id)
+	}
+}

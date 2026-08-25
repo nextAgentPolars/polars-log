@@ -1,0 +1,12 @@
+commit 1618a411ef078d703b798659fc5431aded2df84b
+Author: HOSRookie <Liuxy1933@163.com>
+Date:   Mon Aug 24 11:45:08 2026 +0800
+
+    analysis: activate closure frames by object
+
+ internal/analysis/sqliteinventory/analyze.go       |  19 +--
+ .../analysis/sqliteinventory/closure_execute.go    |  29 ++--
+ internal/analysis/sqliteinventory/flow_return.go   |  10 ++
+ .../analysis/sqliteinventory/function_frame.go     | 179 +++++++++++++++++++++
+ .../sqliteinventory/function_frame_test.go         |  96 +++++++++++
+ 5 files changed, 305 insertions(+), 28 deletions(-)

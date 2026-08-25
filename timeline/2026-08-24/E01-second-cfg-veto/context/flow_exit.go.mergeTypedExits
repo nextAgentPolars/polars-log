@@ -1,0 +1,196 @@
+package sqliteinventory
+
+import (
+	"go/ast"
+	"go/types"
+)
+
+type exitKind string
+
+const (
+	exitNormal   exitKind = "normal"
+	exitReturn   exitKind = "return"
+	exitBreak    exitKind = "break"
+	exitContinue exitKind = "continue"
+	exitPanic    exitKind = "panic"
+	exitGoexit   exitKind = "goexit"
+	exitOpaque   exitKind = "opaque"
+)
+
+// typedExit is the private control-flow carrier.  A nil exits slice means the
+// path is unreachable; a non-nil slice always contains the complete set of
+// exits from one statement or block.  Return values are intentionally limited
+// to slot zero because SQL summaries have one value slot.
+type typedExit struct {
+	kind          exitKind
+	env           valueEnv
+	value         SQLValue
+	label         *types.Label
+	origin        ast.Node
+	reason        string
+	direct        *directSequence
+	directInvalid bool
+}
+
+type blockResult struct {
+	exits []typedExit
+}
+
+func normalExit(env valueEnv) typedExit {
+	return typedExit{kind: exitNormal, env: env}
+}
+
+func returnExit(env valueEnv, value SQLValue, origin ast.Node) typedExit {
+	return typedExit{kind: exitReturn, env: env, value: value, origin: origin}
+}
+
+func directReturnExit(env valueEnv, value SQLValue, origin ast.Node, direct *directSequence, invalid bool) typedExit {
+	return typedExit{kind: exitReturn, env: env, value: value, origin: origin, direct: direct, directInvalid: invalid}
+}
+
+func controlExit(kind exitKind, env valueEnv, label *types.Label, origin ast.Node) typedExit {
+	return typedExit{kind: kind, env: env, label: label, origin: origin}
+}
+
+func opaqueExit(env valueEnv, origin ast.Node, reason string) typedExit {
+	return typedExit{kind: exitOpaque, env: env, origin: origin, reason: reason}
+}
+
+func panicExit(env valueEnv, origin ast.Node) typedExit {
+	return typedExit{kind: exitPanic, env: env, origin: origin, reason: "builtin panic terminates path"}
+}
+
+func goexitExit(env valueEnv, origin ast.Node) typedExit {
+	return typedExit{kind: exitGoexit, env: env, origin: origin, reason: "runtime.Goexit terminates goroutine"}
+}
+
+func hasNormalExit(exits []typedExit) bool {
+	for _, exit := range exits {
+		if exit.kind == exitNormal {
+			return true
+		}
+	}
+	return false
+}
+
+func sameExitLabel(left, right *types.Label) bool {
+	return left == right
+}
+
+func matchesControlLabel(branch, owner *types.Label) bool {
+	return branch == nil || branch == owner
+}
+
+// mergeTypedExits is the only exit join.  Different control kinds never join;
+// same-kind exits with the same label identity join their environments.
+func mergeTypedExits(exits []typedExit, limit int) []typedExit {
+	if len(exits) == 0 {
+		return nil
+	}
+	result := make([]typedExit, 0, len(exits))
+	for _, next := range exits {
+		found, peers := -1, 0
+		for index := range result {
+			if result[index].kind == next.kind && sameExitLabel(result[index].label, next.label) {
+				peers++
+				if sameDeferFrames(result[index].env.deferFrame, next.env.deferFrame) {
+					found = index
+					break
+				}
+			}
+		}
+		if found < 0 && peers >= defAltCap {
+			result = collapseDefAlts(result, next, limit)
+			continue
+		}
+		if found < 0 {
+			result = append(result, next)
+			continue
+		}
+		current := &result[found]
+		current.env = joinEnv(current.env, next.env, limit)
+		if current.kind == exitReturn {
+			if current.direct != nil && next.direct != nil && !sameDirectSequence(*current.direct, *next.direct) {
+				current.directInvalid = true
+			}
+			current.value = joinReturnValues(current.value, next.value, limit)
+			current.direct = mergeDirectExit(current.direct, next.direct, limit)
+			current.directInvalid = current.directInvalid || next.directInvalid
+		}
+	}
+	return result
+}
+
+func collapseDefAlts(exits []typedExit, next typedExit, limit int) []typedExit {
+	result := make([]typedExit, 0, len(exits)-defAltCap+1)
+	for _, current := range exits {
+		if current.kind != next.kind || !sameExitLabel(current.label, next.label) {
+			result = append(result, current)
+			continue
+		}
+		next.env = joinEnv(next.env, current.env, limit)
+		if next.kind == exitReturn {
+			if next.direct != nil && current.direct != nil && !sameDirectSequence(*next.direct, *current.direct) {
+				next.directInvalid = true
+			}
+			next.value = joinReturnValues(next.value, current.value, limit)
+			next.direct = mergeDirectExit(next.direct, current.direct, limit)
+			next.directInvalid = next.directInvalid || current.directInvalid
+		}
+	}
+	next.env.deferFrame.poison |= defAltPoison
+	next.env.deferFrame.tops = nil
+	return append(result, next)
+}
+
+func exitsOfKind(exits []typedExit, kind exitKind) []typedExit {
+	result := make([]typedExit, 0, len(exits))
+	for _, exit := range exits {
+		if exit.kind == kind {
+			result = append(result, exit)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func (a *analyzer) absorbFunctionReturns(function *functionInfo, exits []typedExit) {
+	if function == nil {
+		return
+	}
+	for _, exit := range exits {
+		switch exit.kind {
+		case exitReturn:
+			a.mergeReturnSummary(function.ID, exit.value)
+		case exitBreak, exitContinue:
+			a.addDiagnostic("unsupported_control_exit", "break or continue escaped a function boundary", exit.origin)
+		}
+	}
+	a.absorbDirectReturn(function, exits)
+}
+
+func (a *analyzer) mergeReturnSummary(id SymbolID, value SQLValue) {
+	if id.IsZero() || value.Kind == Bottom {
+		return
+	}
+	joined := mergeValue(a.returns[id], value, a.limit())
+	if !equalValue(joined, a.returns[id]) {
+		a.returns[id] = joined
+		a.returnChanged = true
+	}
+}
+
+func (a *analyzer) boundaryLabel(ident *ast.Ident) *types.Label {
+	if ident == nil {
+		return nil
+	}
+	label, _ := a.typedObject(ident).(*types.Label)
+	return label
+}
+
+func (a *analyzer) reportOpaque(env valueEnv, origin ast.Node, reason string) typedExit {
+	a.addDiagnostic("unsupported_control_flow", reason, origin)
+	return opaqueExit(env, origin, reason)
+}

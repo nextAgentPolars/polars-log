@@ -1,0 +1,242 @@
+diff --git a/pkg/contracts/controlplane/v1/event_identity.go b/pkg/contracts/controlplane/v1/event_identity.go
+new file mode 100644
+index 0000000..edaf868
+--- /dev/null
++++ b/pkg/contracts/controlplane/v1/event_identity.go
+@@ -0,0 +1,236 @@
++package v1
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"strings"
++)
++
++const (
++	// ControlPlaneEventContractVersionV1 is independent from the existing
++	// ContractVersion = "control_plane.v1" dynamic types. This M0 identity
++	// carrier is parallel to those types, not an adapter or replacement; M3
++	// owns any future wiring.
++	ControlPlaneEventContractVersionV1 = "control_plane.event.v1"
++
++	// ControlPlaneEventCanonicalVersionV1 identifies the canonical identity
++	// tuple encoding used by this carrier.
++	ControlPlaneEventCanonicalVersionV1 = "control_plane.event.identity.v1"
++
++	eventFieldLimit = 128
++	refFieldLimit   = 512
++	rawFieldLimit   = 2048
++	encodedLimit    = 4096
++)
++
++// ControlPlaneEventRefsV1 carries opaque references only. The references are
++// intentionally not interpreted or resolved by this contract.
++type ControlPlaneEventRefsV1 struct {
++	IntentEpochRef   string `json:"intent_epoch_ref"`
++	AttemptRef       string `json:"attempt_ref"`
++	AuthorizationRef string `json:"authorization_ref"`
++}
++
++// ControlPlaneEventV1 is the refs-only control-plane event identity carrier.
++// Payload bytes are deliberately not carried here; only their strict digest is
++// part of the event contract.
++type ControlPlaneEventV1 struct {
++	ContractVersion  string                  `json:"contract_version"`
++	CanonicalVersion string                  `json:"canonical_version"`
++	EventID          string                  `json:"event_id"`
++	EventKind        string                  `json:"event_kind"`
++	Producer         string                  `json:"producer"`
++	Refs             ControlPlaneEventRefsV1 `json:"refs"`
++	IdempotencyKey   string                  `json:"idempotency_key"`
++	PayloadDigest    string                  `json:"payload_digest"`
++	CanonicalDigest  string                  `json:"canonical_digest"`
++}
++
++// ComputeControlPlaneEventDigests deterministically fills both identity
++// digests. Existing digest fields are overwritten, so callers can safely
++// recompute after changing an identity field or the payload digest.
++func ComputeControlPlaneEventDigests(event ControlPlaneEventV1) (ControlPlaneEventV1, error) {
++	identityTuple, err := identityTuple(event)
++	if err != nil {
++		return ControlPlaneEventV1{}, err
++	}
++	canonicalTuple, err := canonicalTuple(event)
++	if err != nil {
++		return ControlPlaneEventV1{}, err
++	}
++	event.IdempotencyKey = digestBytes(identityTuple)
++	event.CanonicalDigest = digestBytes(canonicalTuple)
++	return event, nil
++}
++
++// ValidateControlPlaneEvent validates the refs-only event and both derived
++// digests. It does not parse or resolve any reference.
++func ValidateControlPlaneEvent(event ControlPlaneEventV1) error {
++	identityTuple, err := identityTuple(event)
++	if err != nil {
++		return err
++	}
++	canonicalTuple, err := canonicalTuple(event)
++	if err != nil {
++		return err
++	}
++	if err := validateDigest("idempotency_key", event.IdempotencyKey); err != nil {
++		return err
++	}
++	if err := validateDigest("canonical_digest", event.CanonicalDigest); err != nil {
++		return err
++	}
++	if event.IdempotencyKey != digestBytes(identityTuple) {
++		return fmt.Errorf("control plane event idempotency_key does not match canonical identity")
++	}
++	if event.CanonicalDigest != digestBytes(canonicalTuple) {
++		return fmt.Errorf("control plane event canonical_digest does not match canonical identity and payload digest")
++	}
++	return nil
++}
++
++// ControlPlaneEventsEquivalent mechanically identifies valid events with the
++// same idempotency key and canonical digest.
++func ControlPlaneEventsEquivalent(left, right ControlPlaneEventV1) (bool, error) {
++	if err := validatePair(left, right); err != nil {
++		return false, err
++	}
++	return left.IdempotencyKey == right.IdempotencyKey && left.CanonicalDigest == right.CanonicalDigest, nil
++}
++
++// ControlPlaneEventsConflict mechanically identifies valid events with the
++// same idempotency key but different canonical digests.
++func ControlPlaneEventsConflict(left, right ControlPlaneEventV1) (bool, error) {
++	if err := validatePair(left, right); err != nil {
++		return false, err
++	}
++	return left.IdempotencyKey == right.IdempotencyKey && left.CanonicalDigest != right.CanonicalDigest, nil
++}
++
++func validatePair(left, right ControlPlaneEventV1) error {
++	if err := ValidateControlPlaneEvent(left); err != nil {
++		return fmt.Errorf("left control plane event is invalid: %w", err)
++	}
++	if err := ValidateControlPlaneEvent(right); err != nil {
++		return fmt.Errorf("right control plane event is invalid: %w", err)
++	}
++	return nil
++}
++
++func identityTuple(event ControlPlaneEventV1) ([]byte, error) {
++	fields, err := eventFields(event)
++	if err != nil {
++		return nil, err
++	}
++	return encodeTuple(fields[:8])
++}
++
++func canonicalTuple(event ControlPlaneEventV1) ([]byte, error) {
++	fields, err := eventFields(event)
++	if err != nil {
++		return nil, err
++	}
++	return encodeTuple(fields)
++}
++
++func eventFields(event ControlPlaneEventV1) ([]string, error) {
++	if event.ContractVersion != ControlPlaneEventContractVersionV1 {
++		return nil, fmt.Errorf("control plane event contract_version must be %s", ControlPlaneEventContractVersionV1)
++	}
++	if event.CanonicalVersion != ControlPlaneEventCanonicalVersionV1 {
++		return nil, fmt.Errorf("control plane event canonical_version must be %s", ControlPlaneEventCanonicalVersionV1)
++	}
++	fields := []struct {
++		name  string
++		value string
++		limit int
++	}{
++		{name: "contract_version", value: event.ContractVersion, limit: eventFieldLimit},
++		{name: "canonical_version", value: event.CanonicalVersion, limit: eventFieldLimit},
++		{name: "event_id", value: event.EventID, limit: eventFieldLimit},
++		{name: "event_kind", value: event.EventKind, limit: eventFieldLimit},
++		{name: "producer", value: event.Producer, limit: eventFieldLimit},
++		{name: "refs.intent_epoch_ref", value: event.Refs.IntentEpochRef, limit: refFieldLimit},
++		{name: "refs.attempt_ref", value: event.Refs.AttemptRef, limit: refFieldLimit},
++		{name: "refs.authorization_ref", value: event.Refs.AuthorizationRef, limit: refFieldLimit},
++		{name: "payload_digest", value: event.PayloadDigest, limit: len("sha256:") + sha256.Size*2},
++	}
++	values := make([]string, len(fields))
++	rawSize := 0
++	for index, field := range fields {
++		if err := validateValue(field.name, field.value, field.limit); err != nil {
++			return nil, err
++		}
++		if field.name == "payload_digest" && !isSHA256Digest(field.value) {
++			return nil, fmt.Errorf("control plane event %s must match sha256:<64 lowercase hex>", field.name)
++		}
++		rawSize += len(field.value)
++		values[index] = field.value
++	}
++	if rawSize > rawFieldLimit {
++		return nil, fmt.Errorf("control plane event canonical raw fields exceed %d bytes", rawFieldLimit)
++	}
++	return values, nil
++}
++
++func validateValue(field, value string, limit int) error {
++	if len(value) == 0 {
++		return fmt.Errorf("control plane event %s is required", field)
++	}
++	if len(value) > limit {
++		return fmt.Errorf("control plane event %s exceeds %d-byte limit", field, limit)
++	}
++	for index := 0; index < len(value); index++ {
++		char := value[index]
++		if char < 0x21 || char > 0x7e {
++			return fmt.Errorf("control plane event %s must contain only printable ASCII 0x21..0x7e", field)
++		}
++	}
++	return nil
++}
++
++func encodeTuple(fields []string) ([]byte, error) {
++	var buffer bytes.Buffer
++	encoder := json.NewEncoder(&buffer)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(fields); err != nil {
++		return nil, fmt.Errorf("encode control plane event tuple: %w", err)
++	}
++	encoded := buffer.Bytes()
++	if len(encoded) == 0 || encoded[len(encoded)-1] != '\n' {
++		return nil, fmt.Errorf("control plane event tuple must end with one LF")
++	}
++	encoded = encoded[:len(encoded)-1]
++	if len(encoded) > encodedLimit {
++		return nil, fmt.Errorf("control plane event tuple exceeds %d-byte limit", encodedLimit)
++	}
++	return encoded, nil
++}
++
++func validateDigest(field, value string) error {
++	if !isSHA256Digest(value) {
++		return fmt.Errorf("control plane event %s must match sha256:<64 lowercase hex>", field)
++	}
++	return nil
++}
++
++func isSHA256Digest(value string) bool {
++	const prefix = "sha256:"
++	if len(value) != len(prefix)+sha256.Size*2 || !strings.HasPrefix(value, prefix) {
++		return false
++	}
++	for _, char := range value[len(prefix):] {
++		if !(char >= '0' && char <= '9') && !(char >= 'a' && char <= 'f') {
++			return false
++		}
++	}
++	return true
++}
++
++func digestBytes(value []byte) string {
++	digest := sha256.Sum256(value)
++	return "sha256:" + hex.EncodeToString(digest[:])
++}

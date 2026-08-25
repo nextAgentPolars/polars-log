@@ -1,0 +1,33 @@
+diff --git a/internal/analysis/sqliteinventory/flow.go b/internal/analysis/sqliteinventory/flow.go
+index f782de6..41ebabf 100644
+--- a/internal/analysis/sqliteinventory/flow.go
++++ b/internal/analysis/sqliteinventory/flow.go
+@@ -48,15 +48,19 @@ func (a *analyzer) scanStmt(statement ast.Stmt, env valueEnv) blockResult {
+ 	case *ast.BlockStmt:
+ 		return a.scanBlock(value, env)
+ 	case *ast.ExprStmt:
+-		a.invalidateSequenceEscape(&env, nil, value.X)
++		if call, ok := unwrapParen(value.X).(*ast.CallExpr); !ok || !a.readOnlyCall(call, env) {
++			a.invalidateSequenceEscape(&env, nil, value.X)
++		}
+ 		if call, ok := unwrapParen(value.X).(*ast.CallExpr); ok && a.builtinPanic(call) {
+ 			a.evalReceipt(call, env)
+ 			return blockResult{exits: []typedExit{opaqueExit(env, call, "builtin panic terminates path")}}
+ 		}
+ 		a.evalExpr(value.X, env)
+ 	case *ast.DeclStmt:
++		a.recordDecl(value, &env)
+ 		a.scanDecl(value, &env)
+ 	case *ast.AssignStmt:
++		a.recordAssignment(value, &env)
+ 		a.scanAssign(value, &env)
+ 	case *ast.ReturnStmt:
+ 		return a.scanReturn(value, env)
+@@ -75,6 +79,7 @@ func (a *analyzer) scanStmt(statement ast.Stmt, env valueEnv) blockResult {
+ 	case *ast.DeferStmt:
+ 		a.evalScheduledReceipt(value.Call, env)
+ 	case *ast.IncDecStmt:
++		env.recordWrite(a.current, value.X)
+ 		a.invalidateNumericBranchTarget(&env, value.X)
+ 		a.invalidateSequenceTarget(&env, value.X)
+ 	case *ast.SendStmt:

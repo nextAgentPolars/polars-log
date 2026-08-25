@@ -1,0 +1,124 @@
+{
+  "Root": "/private/tmp/receipt-demo/sample",
+  "Symbols": [
+    {
+      "id": {
+        "package_path": "demo.store",
+        "rel_path": "sample.go",
+        "name": "Upsert",
+        "type_arity": 0
+      },
+      "kind": "function",
+      "name": "Upsert",
+      "package": "store",
+      "file": "sample.go",
+      "line": 7,
+      "column": 6,
+      "exported": true,
+      "params": [
+        {
+          "name": "db",
+          "type": "*sql.DB"
+        },
+        {
+          "name": "legacy",
+          "type": "bool"
+        }
+      ]
+    }
+  ],
+  "Edges": null,
+  "Executions": [
+    {
+      "id": "demo.store::sample.go::::Upsert[0]@sample.go:9:2:exec",
+      "function": {
+        "package_path": "demo.store",
+        "rel_path": "sample.go",
+        "name": "Upsert",
+        "type_arity": 0
+      },
+      "method": "Exec",
+      "kind": "exec",
+      "file": "sample.go",
+      "line": 9,
+      "column": 2,
+      "value": {
+        "kind": "exact",
+        "text": "CREATE TABLE IF NOT EXISTS demo_log(id INTEGER)"
+      },
+      "fact": {
+        "operation": "ddl",
+        "target": "t",
+        "tables": [
+          "t"
+        ],
+        "complete": true,
+        "statements": [
+          {
+            "operation": "ddl",
+            "target": "t",
+            "tables": [
+              "t"
+            ],
+            "complete": true
+          }
+        ],
+        "alternatives": [
+          {
+            "operation": "ddl",
+            "target": "t",
+            "tables": [
+              "t"
+            ],
+            "complete": true,
+            "statements": [
+              {
+                "operation": "ddl",
+                "target": "t",
+                "tables": [
+                  "t"
+                ],
+                "complete": true
+              }
+            ]
+          }
+        ]
+      },
+      "prepared_from": {
+        "package_path": "",
+        "rel_path": "",
+        "name": "",
+        "type_arity": 0
+      },
+      "complete": true
+    }
+  ],
+  "Functions": [
+    {
+      "id": {
+        "package_path": "demo.store",
+        "rel_path": "sample.go",
+        "name": "Upsert",
+        "type_arity": 0
+      },
+      "name": "Upsert",
+      "package": "store",
+      "file": "sample.go",
+      "line": 7,
+      "column": 6,
+      "params": [
+        {
+          "name": "db",
+          "type": "*sql.DB"
+        },
+        {
+          "name": "legacy",
+          "type": "bool"
+        }
+      ],
+      "literal": false,
+      "complete": true
+    }
+  ],
+  "Diagnostics": null
+}
