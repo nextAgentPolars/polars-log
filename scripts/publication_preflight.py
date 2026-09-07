@@ -8,6 +8,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
+PUBLICATION_BASE = '5daeffbe8c32a74a53a6a60dc72d20b538732cbd'
 
 
 def git(*args):
@@ -51,7 +52,8 @@ def main():
     head = git('rev-parse', 'HEAD').decode().strip()
     assert head == args.expected_head, 'HEAD drift'
     assert not git('status', '--porcelain', '--untracked-files=no').strip(), 'tracked worktree/index dirty'
-    git('diff', '--check', 'HEAD')
+    git('merge-base', '--is-ancestor', PUBLICATION_BASE, head)
+    git('diff', '--check', PUBLICATION_BASE, head)
     paths = git('ls-tree', '-r', '--name-only', 'HEAD').decode().splitlines()
     manifests = [p for p in paths if p.startswith('batches/') and p.endswith('/manifest.json')]
     count = 0
@@ -69,6 +71,7 @@ def main():
         'worktree': str(ROOT), 'head': head,
         'tree': git('rev-parse', 'HEAD^{tree}').decode().strip(),
         'publication_repository': 'nextAgentPolars/polars-log',
+        'publication_base': PUBLICATION_BASE,
         'batches': len(manifests), 'hashed_files': count,
         'untracked_files_excluded': len(git('ls-files', '--others', '--exclude-standard').decode().splitlines()),
         'scope': 'committed batch hashes and pattern scan; not proof of complete redaction or historical test execution'
