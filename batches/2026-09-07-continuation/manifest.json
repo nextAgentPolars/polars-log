@@ -1,0 +1,245 @@
+{
+  "schema": "polars.public-evidence-batch.v1",
+  "exported_at": "2026-09-07T05:05:25.369801+00:00",
+  "source_repository": "Polaris1933/beijixing",
+  "source_end_commit": "427c7580b19563f9d2a6bf5bec5f776256d71075",
+  "source_end_tree": "3fc37dcbda14df2376eabf138f178ce2021fcbbb",
+  "coverage": {
+    "committer_time_after_exclusive": "2026-08-25T02:26:00+00:00",
+    "reachable_from": "427c7580b19563f9d2a6bf5bec5f776256d71075",
+    "commit_count": 399,
+    "selected_event_count": 3,
+    "session_coverage": "not_exported",
+    "human_technical_intervention": "unknown",
+    "complete_run_claim": false
+  },
+  "verification": {
+    "tests_rerun": false,
+    "historical_test_results": "source-document claims, not fresh execution",
+    "source_bytes": "exact Git-object extracts; no live worktree reads"
+  },
+  "files": [
+    {
+      "path": "commits.jsonl",
+      "bytes": 106183,
+      "sha256": "429a77f52e920a7e9030cbda03e33579158bb46dd85c9d91a3c6e50ea82557c6",
+      "provenance": {
+        "kind": "git_commit_inventory",
+        "reachable_from": "427c7580b19563f9d2a6bf5bec5f776256d71075",
+        "committer_time_after_exclusive": "2026-08-25T02:26:00+00:00",
+        "fields": [
+          "commit",
+          "tree",
+          "parents",
+          "committed_at",
+          "subject"
+        ],
+        "authors_emails_excluded": true
+      }
+    },
+    {
+      "path": "events/2026-08-25_1511_staged_sequence_proofs/diff/1014074.patch",
+      "bytes": 37896,
+      "sha256": "ced1862643089d1cd1b9e31c4efd66dc80d528de33aee7380cb10cfb31e0905e",
+      "provenance": {
+        "kind": "git_command",
+        "argv": [
+          "show",
+          "--format=",
+          "--no-ext-diff",
+          "--no-renames",
+          "101407452b3483a7f9b456f4fa75de453a7b081e",
+          "--",
+          "internal/analysis/sqliteinventory/adapter_return_test.go",
+          "internal/analysis/sqliteinventory/flow_if.go",
+          "internal/analysis/sqliteinventory/sequence_join.go",
+          "internal/analysis/sqliteinventory/sequence_stage_test.go",
+          "internal/analysis/sqliteinventory/sequence_value.go"
+        ],
+        "commit": "101407452b3483a7f9b456f4fa75de453a7b081e",
+        "tree": "f4564834e47e8044fc4726c7d96c3d7398ffccc0"
+      }
+    },
+    {
+      "path": "events/2026-09-01_1039_candidate_material_r4/diff/02a7c79.patch",
+      "bytes": 53138,
+      "sha256": "63274faf63915749edf8835a22c2cd4a04e0a1f989f2c6bb22fb99cabd1057ac",
+      "provenance": {
+        "kind": "git_command",
+        "argv": [
+          "show",
+          "--format=",
+          "--no-ext-diff",
+          "--no-renames",
+          "02a7c799a54ecf046f5dd5a8bf94bc25623d9eb8",
+          "--",
+          "internal/runtime/source/owner_material.go",
+          "internal/runtime/source/owner_material_open_unix.go",
+          "internal/runtime/source/owner_material_open_windows.go",
+          "internal/runtime/source/owner_material_test.go",
+          "internal/runtime/source/owner_material_unix_test.go",
+          "internal/runtime/source/owner_material_windows_test.go"
+        ],
+        "commit": "02a7c799a54ecf046f5dd5a8bf94bc25623d9eb8",
+        "tree": "7f9bb6b52b84cfa5e29a898cfca9b3c03bb87a3e"
+      }
+    },
+    {
+      "path": "events/2026-09-02_2131_first_boot_source_seal/diff/3270719.patch",
+      "bytes": 90564,
+      "sha256": "452e894670d6edd0673314bfea8cf99661a60b924fdb24ba306ab9c9ff6317e1",
+      "provenance": {
+        "kind": "git_command",
+        "argv": [
+          "show",
+          "--format=",
+          "--no-ext-diff",
+          "--no-renames",
+          "327071960df5366739d3e5ec7c73da41ecb4a77c",
+          "--",
+          "cmd/gateway/bootstrap_source.go",
+          "cmd/gateway/bootstrap_source_test.go",
+          "cmd/gateway/runtime_mount.go",
+          "cmd/gateway/runtime_mount_test.go",
+          "cmd/gateway/session_supervisor.go",
+          "cmd/gateway/session_supervisor_test.go",
+          "internal/store/sqlite/initial_source_branch_test.go"
+        ],
+        "commit": "327071960df5366739d3e5ec7c73da41ecb4a77c",
+        "tree": "b73ba878e0120af836f551d933999493144fc9ce"
+      }
+    },
+    {
+      "path": "events/2026-09-02_2131_first_boot_source_seal/diff/7831515.patch",
+      "bytes": 13860,
+      "sha256": "27f72c21989ad07e0e386f408c7d5425ff0e472d9c398d4726f866b9d0b27b94",
+      "provenance": {
+        "kind": "git_command",
+        "argv": [
+          "show",
+          "--format=",
+          "--no-ext-diff",
+          "--no-renames",
+          "78315152baa64b83236feb64b7b013d5c52ca459",
+          "--",
+          "cmd/gateway/bootstrap_capture_test.go",
+          "pkg/contracts/intent/v1/writer_inventory_test.go"
+        ],
+        "commit": "78315152baa64b83236feb64b7b013d5c52ca459",
+        "tree": "347e7e9ec1173ebd50b4bbf9e87db13f55de449b"
+      }
+    },
+    {
+      "path": "events/2026-09-01_1039_candidate_material_r4/r3-retirement.original.md",
+      "bytes": 950,
+      "sha256": "f9c558264c180d6a426a8341ab2b41b1a625d740ad93191927048392e1d7e104",
+      "provenance": {
+        "kind": "git_blob_lines",
+        "commit": "18cdc1d6739d875c6d38e74a7c7e611b3648047a",
+        "path": "docs/意图识别8.23 思想风暴.md",
+        "blob": "7c3e5ee3fcc1b3edf2ebe6fccba2235453ac10ed",
+        "source_sha256": "2f87a33557c58f44966a9abba12635ab5016f9770b846b0e832e39055364bb44",
+        "line_start": 13304,
+        "line_end": 13316
+      }
+    },
+    {
+      "path": "events/2026-09-01_1039_candidate_material_r4/code-seal.original.md",
+      "bytes": 4234,
+      "sha256": "2529bddaa0590d0a048ebf08ae3d64521574e49d12399c3091b8878798a5780c",
+      "provenance": {
+        "kind": "git_blob_lines",
+        "commit": "d37932abfb257e91695792aa16d9356fe5e5231d",
+        "path": "docs/意图识别8.23 思想风暴.md",
+        "blob": "75d62c600aa3ad1c09737f3f6219945b5bbc88a5",
+        "source_sha256": "ec83e1c81a4edcee69514bf2fd14e42e365612015c54c6b5cf3330861d970824",
+        "line_start": 13393,
+        "line_end": 13462
+      }
+    },
+    {
+      "path": "events/2026-09-02_2131_first_boot_source_seal/final-seal.original.md",
+      "bytes": 7159,
+      "sha256": "ac151261ae3a4a6b08719e56db3e70ea7866c7caf4e3a54d5ae39ba723c4cc15",
+      "provenance": {
+        "kind": "git_blob_lines",
+        "commit": "427c7580b19563f9d2a6bf5bec5f776256d71075",
+        "path": "docs/意图识别8.23 思想风暴.md",
+        "blob": "658f221c1b238d27b523a94d2b0127882821a52a",
+        "source_sha256": "829427e2392d5ba090bcbf2fd73ce5a8b93f9f200ee7452ee05383c2fb6b409c",
+        "line_start": 16372,
+        "line_end": 16429
+      }
+    },
+    {
+      "path": "events/2026-08-25_1511_staged_sequence_proofs/time-anchor.md",
+      "bytes": 649,
+      "sha256": "df4d8d647a068820dc0158b05d3cb38c57227b0c0188caaa1b38a03402b81986",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    },
+    {
+      "path": "events/2026-09-01_1039_candidate_material_r4/time-anchor.md",
+      "bytes": 649,
+      "sha256": "b0012664291af5f4a12df0f1c895ce9f25364af9887c410a8d6f932646b7ef4d",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    },
+    {
+      "path": "events/2026-09-02_2131_first_boot_source_seal/time-anchor.md",
+      "bytes": 656,
+      "sha256": "f204b885d3f19abec8e87dbf7a30e61b9d97ae5a1596fe7eb9c8b4c9b091a702",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    },
+    {
+      "path": "events/2026-08-25_1511_staged_sequence_proofs/decision_summary.md",
+      "bytes": 855,
+      "sha256": "d26725022ca677f200af5500c2b6e97958172a51b3ab13696315eeaab300b744",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    },
+    {
+      "path": "events/2026-09-01_1039_candidate_material_r4/decision_summary.md",
+      "bytes": 1345,
+      "sha256": "3bfa9fcc7d324e3fa0a76c0848737c5a944389575935f031c196902657e1d066",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    },
+    {
+      "path": "events/2026-09-02_2131_first_boot_source_seal/decision_summary.md",
+      "bytes": 1354,
+      "sha256": "5c2a3c88ddd0d6ea21667f5db64ceb4a5740e46943fd359c79f0e18184ce576c",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    },
+    {
+      "path": "README.md",
+      "bytes": 2236,
+      "sha256": "928ca4c95c4f86f92d87c0391235167dd10428fa022223f5f96c2141fd704d6e",
+      "provenance": {
+        "kind": "editorial_navigation",
+        "written_at": "2026-09-07",
+        "not_original_session_text": true
+      }
+    }
+  ]
+}

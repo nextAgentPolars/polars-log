@@ -1,0 +1,3 @@
+# Archived unified diffs contain mandatory context prefixes (space + source tabs).
+# Preserve exact evidence bytes; integrity is checked by manifest/source replay.
+batches/**/diff/*.patch -whitespace

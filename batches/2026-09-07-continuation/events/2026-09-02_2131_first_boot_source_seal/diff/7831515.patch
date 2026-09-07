@@ -1,0 +1,371 @@
+diff --git a/cmd/gateway/bootstrap_capture_test.go b/cmd/gateway/bootstrap_capture_test.go
+index e5bc970..5e924d9 100644
+--- a/cmd/gateway/bootstrap_capture_test.go
++++ b/cmd/gateway/bootstrap_capture_test.go
+@@ -637,7 +637,8 @@ func TestBootstrapPreCaptureCallers(t *testing.T) {
+ 	if !ok {
+ 		t.Fatal("runtime caller unavailable")
+ 	}
+-	pkg := capturePackage(t, filepath.Dir(filepath.Dir(filepath.Dir(testPath))))
++	root := filepath.Dir(filepath.Dir(filepath.Dir(testPath)))
++	pkg := capturePackage(t, root)
+ 	objects := map[string]types.Object{}
+ 	for _, name := range []string{"composeSource", "finishPreCapture"} {
+ 		object := pkg.Types.Scope().Lookup(name)
+@@ -647,10 +648,20 @@ func TestBootstrapPreCaptureCallers(t *testing.T) {
+ 		objects[name] = object
+ 	}
+ 	for _, name := range []string{"ProduceCapture", "ValidateWriterInventory"} {
+-		object := pkg.TypesInfo.Uses[findCaptureSelector(pkg, name)]
++		selector := findCaptureSelector(pkg, name)
++		if selector == nil {
++			t.Fatalf("gateway imported selector %s missing", name)
++		}
++		object := pkg.TypesInfo.Uses[selector]
+ 		if object == nil {
+ 			t.Fatalf("gateway imported object %s missing", name)
+ 		}
++		if name == "ProduceCapture" {
++			function, ok := object.(*types.Func)
++			if !ok || function.Name() != "ProduceCapture" || function.Pkg() == nil || function.Pkg().Path() != "polaris/internal/application/intentinventory" || function.Parent() != function.Pkg().Scope() {
++				t.Fatalf("gateway ProduceCapture object is not canonical: %T", object)
++			}
++		}
+ 		objects[name] = object
+ 	}
+ 	counts := map[string]int{}
+@@ -666,27 +677,35 @@ func TestBootstrapPreCaptureCallers(t *testing.T) {
+ 			if !ok || function.Body == nil {
+ 				continue
+ 			}
+-			for _, call := range captureDirectCalls(function.Body) {
++			for _, site := range captureDirectSites(function.Body) {
++				call := site.call
+ 				object := captureObject(pkg, captureCallee(call.Fun))
+ 				for name, target := range objects {
+ 					if object != target {
+ 						continue
+ 					}
+ 					counts[name]++
++					if name == "ProduceCapture" {
++						if !captureProduceSite(root, path, function, site) {
++							t.Fatalf("%s caller escaped: %s %s", name, path, function.Name.Name)
++						}
++					} else if path != filepath.ToSlash(filepath.Join(root, "cmd", "gateway", "bootstrap_capture.go")) || !allowed[name][function.Name.Name] {
++						t.Fatalf("%s caller escaped: %s %s", name, path, function.Name.Name)
++					}
+ 					if selector, ok := captureCallee(call.Fun).(*ast.SelectorExpr); ok {
+ 						allowedIDs[selector.Sel] = true
+ 					} else if ident, ok := captureCallee(call.Fun).(*ast.Ident); ok {
+ 						allowedIDs[ident] = true
+ 					}
+-					if path != filepath.ToSlash(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(testPath))), "cmd", "gateway", "bootstrap_capture.go")) || !allowed[name][function.Name.Name] {
+-						t.Fatalf("%s caller escaped: %s %s", name, path, function.Name.Name)
+-					}
+ 					want := map[string][]string{
+ 						"composeSource":           {"ctx", "initial", "material", "ingress"},
+ 						"finishPreCapture":        {"ctx", "initial", "material", "before", "report"},
+ 						"ProduceCapture":          {"ctx", "before.MaterialPath"},
+ 						"ValidateWriterInventory": {"report.Inventory"},
+ 					}[name]
++					if name == "ProduceCapture" && function.Name.Name == "capture" {
++						want = []string{"ctx", "input.StagingPath"}
++					}
+ 					if name == "composeSource" && function.Name.Name == "finishPreCapture" {
+ 						want = []string{"ctx", "initial", "material", "before.Ingress"}
+ 					}
+@@ -714,7 +733,7 @@ func TestBootstrapPreCaptureCallers(t *testing.T) {
+ 			return true
+ 		})
+ 	}
+-	if counts["composeSource"] != 2 || counts["finishPreCapture"] != 1 || counts["ProduceCapture"] != 1 || counts["ValidateWriterInventory"] != 1 {
++	if counts["composeSource"] != 2 || counts["finishPreCapture"] != 1 || counts["ProduceCapture"] != 2 || counts["ValidateWriterInventory"] != 1 {
+ 		t.Fatalf("gateway caller counts=%v", counts)
+ 	}
+ }
+@@ -747,26 +766,83 @@ func findCaptureSelector(pkg *packages.Package, name string) *ast.Ident {
+ }
+ 
+ type captureCallWalk struct {
+-	calls []*ast.CallExpr
++	sites     []captureCallSite
++	stack     []ast.Node
++	callDepth int
++}
++
++type captureCallSite struct {
++	call   *ast.CallExpr
++	parent ast.Node
+ }
+ 
+ func (walk *captureCallWalk) Visit(node ast.Node) ast.Visitor {
+ 	if node == nil {
++		last := len(walk.stack) - 1
++		if last >= 0 {
++			if _, ok := walk.stack[last].(*ast.CallExpr); ok {
++				walk.callDepth--
++			}
++			walk.stack = walk.stack[:last]
++		}
+ 		return walk
+ 	}
+ 	if _, ok := node.(*ast.FuncLit); ok {
+ 		return nil
+ 	}
++	parent := ast.Node(nil)
++	if len(walk.stack) != 0 {
++		parent = walk.stack[len(walk.stack)-1]
++	}
+ 	if call, ok := node.(*ast.CallExpr); ok {
+-		walk.calls = append(walk.calls, call)
++		if walk.callDepth == 0 {
++			walk.sites = append(walk.sites, captureCallSite{call: call, parent: parent})
++		}
++		walk.callDepth++
+ 	}
++	walk.stack = append(walk.stack, node)
+ 	return walk
+ }
+ 
+-func captureDirectCalls(node ast.Node) []*ast.CallExpr {
++func captureDirectSites(node ast.Node) []captureCallSite {
+ 	walk := &captureCallWalk{}
+ 	ast.Walk(walk, node)
+-	return walk.calls
++	return walk.sites
++}
++
++func captureProduceSite(root, path string, function *ast.FuncDecl, site captureCallSite) bool {
++	if function == nil || site.call == nil {
++		return false
++	}
++	assignment, ok := site.parent.(*ast.AssignStmt)
++	if !ok || assignment.Tok != token.DEFINE {
++		return false
++	}
++	selector, ok := captureCallee(site.call.Fun).(*ast.SelectorExpr)
++	if !ok || selector.Sel.Name != "ProduceCapture" {
++		return false
++	}
++	packageIdent, ok := selector.X.(*ast.Ident)
++	if !ok || packageIdent.Name != "intentinventory" {
++		return false
++	}
++	captureFile := filepath.ToSlash(filepath.Join(root, "cmd", "gateway", "bootstrap_capture.go"))
++	sourceFile := filepath.ToSlash(filepath.Join(root, "cmd", "gateway", "bootstrap_source.go"))
++	if path == captureFile {
++		return function.Name.Name == "preCaptureSource" && function.Recv == nil
++	}
++	if path == sourceFile {
++		if function.Name.Name != "capture" || function.Recv == nil || len(function.Recv.List) != 1 {
++			return false
++		}
++		field := function.Recv.List[0]
++		if len(field.Names) != 1 || field.Names[0].Name != "c" {
++			return false
++		}
++		receiver, ok := field.Type.(*ast.Ident)
++		return ok && receiver.Name == "initialCapture"
++	}
++	return false
+ }
+ 
+ func captureSignature(t *testing.T, pkg *packages.Package, function *ast.FuncDecl, name string, params []string, result string) {
+diff --git a/pkg/contracts/intent/v1/writer_inventory_test.go b/pkg/contracts/intent/v1/writer_inventory_test.go
+index 832bca4..1024ef5 100644
+--- a/pkg/contracts/intent/v1/writer_inventory_test.go
++++ b/pkg/contracts/intent/v1/writer_inventory_test.go
+@@ -845,6 +845,7 @@ func carrierDecl(pkg *packages.Package, decl ast.Decl) bool {
+ }
+ func checkCallers(t *testing.T, pkgs []*packages.Package) {
+ 	t.Helper()
++	produceSites := 0
+ 	for _, pkg := range pkgs {
+ 		own := pkg.PkgPath == inventoryPath
+ 		producerPkg := pkg.PkgPath == producerPath
+@@ -854,6 +855,7 @@ func checkCallers(t *testing.T, pkgs []*packages.Package) {
+ 			producer := pkg.PkgPath == producerPath && filepath.Base(filePath) == "producer.go"
+ 			gatewayProduce := gatewayCaptureSite(pkg, file, "ProduceCapture")
+ 			gatewayValidate := gatewayCaptureSite(pkg, file, "ValidateWriterInventory")
++			produceSites += len(gatewayProduce)
+ 			ast.Inspect(file, func(node ast.Node) bool {
+ 				ident, ok := node.(*ast.Ident)
+ 				if !ok {
+@@ -919,6 +921,9 @@ func checkCallers(t *testing.T, pkgs []*packages.Package) {
+ 			}
+ 		}
+ 	}
++	if produceSites != 2 {
++		t.Fatalf("gateway ProduceCapture caller count=%d", produceSites)
++	}
+ 	checkM1(t, pkgs)
+ }
+ 
+@@ -941,53 +946,47 @@ func gatewayCaptureSite(pkg *packages.Package, file *ast.File, method string) ma
+ 		return allowed
+ 	}
+ 	path := filepath.ToSlash(filepath.Clean(pkg.Fset.Position(file.Pos()).Filename))
+-	if !strings.HasSuffix(path, "/cmd/gateway/bootstrap_capture.go") {
++	if method == "ProduceCapture" {
++		if !strings.HasSuffix(path, "/cmd/gateway/bootstrap_capture.go") && !strings.HasSuffix(path, "/cmd/gateway/bootstrap_source.go") {
++			return allowed
++		}
++	} else if !strings.HasSuffix(path, "/cmd/gateway/bootstrap_capture.go") {
+ 		return allowed
+ 	}
+ 	for _, declaration := range file.Decls {
+ 		function, ok := declaration.(*ast.FuncDecl)
+-		if !ok || function.Recv != nil || function.Body == nil || function.Name == nil {
+-			continue
+-		}
+-		wantFunction := method == "ProduceCapture" && function.Name.Name == "preCaptureSource" || method == "ValidateWriterInventory" && function.Name.Name == "finishPreCapture"
+-		if !wantFunction {
++		if !ok || function.Body == nil || function.Name == nil || !gatewayCaptureFunction(path, function, method) {
+ 			continue
+ 		}
+-		hasClosure := false
++		callDepth := 0
++		stack := []ast.Node{}
+ 		ast.Inspect(function.Body, func(node ast.Node) bool {
+-			if _, ok := node.(*ast.FuncLit); ok {
+-				hasClosure = true
+-			}
+-			call, ok := node.(*ast.CallExpr)
+-			if !ok || hasClosure {
+-				return true
+-			}
+-			selector, ok := call.Fun.(*ast.SelectorExpr)
+-			wantArgs := 2
+-			if method == "ValidateWriterInventory" {
+-				wantArgs = 1
+-			}
+-			if !ok || selector.Sel.Name != method || len(call.Args) != wantArgs {
+-				return true
+-			}
+-			packageIdent, ok := selector.X.(*ast.Ident)
+-			if !ok {
+-				return true
+-			}
+-			wantPackage := method == "ProduceCapture" && packageIdent.Name == "intentinventory" || method == "ValidateWriterInventory" && packageIdent.Name == "intentv1"
+-			if !wantPackage {
++			if node == nil {
++				last := len(stack) - 1
++				if last >= 0 {
++					if _, ok := stack[last].(*ast.CallExpr); ok {
++						callDepth--
++					}
++					stack = stack[:last]
++				}
+ 				return true
+ 			}
+-			if method == "ProduceCapture" && (!sourceExpr(call.Args[0], "ctx") || !sourceExpr(call.Args[1], "before.MaterialPath")) {
+-				return true
++			if _, ok := node.(*ast.FuncLit); ok {
++				return false
+ 			}
+-			if method == "ValidateWriterInventory" && !sourceExpr(call.Args[0], "report.Inventory") {
+-				return true
++			parent := ast.Node(nil)
++			if len(stack) != 0 {
++				parent = stack[len(stack)-1]
+ 			}
+-			if object := pkg.TypesInfo.Uses[selector.Sel]; object == nil || object.Name() != method || object.Pkg() == nil || object.Parent() != object.Pkg().Scope() || object.Pkg().Path() != producerPath && method == "ProduceCapture" || object.Pkg() == nil || object.Pkg().Path() != inventoryPath && method == "ValidateWriterInventory" {
+-				return true
++			if call, ok := node.(*ast.CallExpr); ok {
++				if callDepth == 0 {
++					if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == method && gatewayCaptureExact(pkg, path, function, method, selector, call, parent) {
++						allowed[selector.Sel] = true
++					}
++				}
++				callDepth++
+ 			}
+-			allowed[selector.Sel] = true
++			stack = append(stack, node)
+ 			return true
+ 		})
+ 	}
+@@ -997,6 +996,84 @@ func gatewayCaptureSite(pkg *packages.Package, file *ast.File, method string) ma
+ 	return allowed
+ }
+ 
++func gatewayCaptureFunction(path string, function *ast.FuncDecl, method string) bool {
++	if function == nil || function.Name == nil || function.Body == nil {
++		return false
++	}
++	switch method {
++	case "ProduceCapture":
++		switch {
++		case strings.HasSuffix(path, "/cmd/gateway/bootstrap_capture.go"):
++			return function.Name.Name == "preCaptureSource" && function.Recv == nil
++		case strings.HasSuffix(path, "/cmd/gateway/bootstrap_source.go"):
++			return function.Name.Name == "capture" && initialCaptureReceiver(function)
++		default:
++			return false
++		}
++	case "ValidateWriterInventory":
++		return strings.HasSuffix(path, "/cmd/gateway/bootstrap_capture.go") && function.Name.Name == "finishPreCapture" && function.Recv == nil
++	default:
++		return false
++	}
++}
++
++func initialCaptureReceiver(function *ast.FuncDecl) bool {
++	if function.Recv == nil || len(function.Recv.List) != 1 {
++		return false
++	}
++	field := function.Recv.List[0]
++	if len(field.Names) != 1 || field.Names[0].Name != "c" {
++		return false
++	}
++	receiver, ok := field.Type.(*ast.Ident)
++	return ok && receiver.Name == "initialCapture"
++}
++
++func gatewayCaptureExact(pkg *packages.Package, path string, function *ast.FuncDecl, method string, selector *ast.SelectorExpr, call *ast.CallExpr, parent ast.Node) bool {
++	assignment, ok := parent.(*ast.AssignStmt)
++	if !ok || assignment.Tok != token.DEFINE {
++		return false
++	}
++	packageIdent, ok := selector.X.(*ast.Ident)
++	if !ok {
++		return false
++	}
++	wantPackage := ""
++	wantArgs := []string{}
++	switch method {
++	case "ProduceCapture":
++		wantPackage = "intentinventory"
++		if strings.HasSuffix(path, "/cmd/gateway/bootstrap_capture.go") {
++			wantArgs = []string{"ctx", "before.MaterialPath"}
++		} else if strings.HasSuffix(path, "/cmd/gateway/bootstrap_source.go") {
++			wantArgs = []string{"ctx", "input.StagingPath"}
++		} else {
++			return false
++		}
++	case "ValidateWriterInventory":
++		wantPackage = "intentv1"
++		wantArgs = []string{"report.Inventory"}
++	default:
++		return false
++	}
++	if packageIdent.Name != wantPackage || len(call.Args) != len(wantArgs) {
++		return false
++	}
++	for index, want := range wantArgs {
++		if !sourceExpr(call.Args[index], want) {
++			return false
++		}
++	}
++	object := pkg.TypesInfo.Uses[selector.Sel]
++	if object == nil || object.Name() != method || object.Pkg() == nil || object.Parent() != object.Pkg().Scope() {
++		return false
++	}
++	if method == "ProduceCapture" && object.Pkg().Path() != producerPath {
++		return false
++	}
++	return method != "ValidateWriterInventory" || object.Pkg().Path() == inventoryPath
++}
++
+ func sourceExpr(expr ast.Expr, want string) bool {
+ 	parts := strings.Split(want, ".")
+ 	if len(parts) == 2 {

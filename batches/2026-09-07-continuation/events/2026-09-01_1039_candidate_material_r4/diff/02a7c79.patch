@@ -1,0 +1,1523 @@
+diff --git a/internal/runtime/source/owner_material.go b/internal/runtime/source/owner_material.go
+new file mode 100644
+index 0000000..736b321
+--- /dev/null
++++ b/internal/runtime/source/owner_material.go
+@@ -0,0 +1,175 @@
++package source
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++
++	storeiface "polaris/internal/store"
++)
++
++// CandidateMaterialV1 carries one call-time verified path and supplied current.
++// It does not prove durable origin, currentness, or post-return stability.
++type CandidateMaterialV1 struct {
++	Current       storeiface.SourceAuthorityCurrentV1
++	CandidatePath string
++}
++
++func materialFailure(cause error) (CandidateMaterialV1, error) {
++	if cause == nil {
++		cause = sourceError("source_authority_unavailable", fmt.Errorf("candidate material failed without a cause"))
++	}
++	return CandidateMaterialV1{}, cause
++}
++
++type materialSnapshot struct {
++	rootPath      string
++	candidateDir  string
++	candidatePath string
++	root          *os.File
++	candidates    *os.File
++	candidate     *os.File
++	rootInfo      os.FileInfo
++	candidateInfo os.FileInfo
++	materialInfo  os.FileInfo
++}
++
++// InspectCandidateMaterial checks one supplied RestartDurable relationship
++// without changing source authority state.
++func (o *Owner) InspectCandidateMaterial(ctx context.Context, branch storeiface.InitialSourceBranchResultV1) (CandidateMaterialV1, error) {
++	if ctx == nil {
++		return materialFailure(sourceError("source_input_invalid", fmt.Errorf("context is nil")))
++	}
++	if branch.Kind != storeiface.InitialSourceBranchRestartDurableV1 {
++		return materialFailure(sourceError("source_input_invalid", fmt.Errorf("initial source branch is not restart durable")))
++	}
++	current := branch.Current
++	if current.CandidateRef == "" || current.RootDigest == "" || !strictDigest(current.CandidateRef) || !strictDigest(current.RootDigest) || current.CandidateRef != current.RootDigest {
++		return materialFailure(sourceError("source_input_invalid", fmt.Errorf("candidate and root digests are invalid")))
++	}
++	if o == nil {
++		return materialFailure(sourceError("source_authority_unavailable", fmt.Errorf("source owner is unavailable")))
++	}
++	if err := ctx.Err(); err != nil {
++		return materialFailure(sourceError("source_authority_unavailable", err))
++	}
++	pre, err := o.openMaterial(current.CandidateRef)
++	if err != nil {
++		return materialFailure(err)
++	}
++	verified, verifyErr := o.verifyCandidate(current.CandidateRef, current.RootDigest)
++	if verifyErr != nil {
++		return materialFailure(closeMaterial(pre, verifyErr))
++	}
++	if err := ctx.Err(); err != nil {
++		return materialFailure(closeMaterial(pre, sourceError("source_authority_unavailable", err)))
++	}
++	post, err := o.openMaterial(current.CandidateRef)
++	if err != nil {
++		return materialFailure(closeMaterial(pre, err))
++	}
++	identityOK := sameMaterial(pre, post)
++	if err := ctx.Err(); err != nil {
++		return materialFailure(closeMaterial(pre, closeMaterial(post, sourceError("source_authority_unavailable", err))))
++	}
++	if !identityOK {
++		return materialFailure(closeMaterial(pre, closeMaterial(post, sourceError("source_authority_corrupt", fmt.Errorf("candidate material identity changed")))))
++	}
++	if err := closeMaterial(pre, nil); err != nil {
++		return materialFailure(closeMaterial(post, err))
++	}
++	if err := closeMaterial(post, nil); err != nil {
++		return materialFailure(sourceError("source_authority_unavailable", err))
++	}
++	return CandidateMaterialV1{Current: current, CandidatePath: verified}, nil
++}
++
++func (o *Owner) openMaterial(ref string) (*materialSnapshot, error) {
++	target, err := o.candidateTarget(ref)
++	if err != nil {
++		return nil, err
++	}
++	root := filepath.Dir(filepath.Dir(target))
++	candidates := filepath.Dir(target)
++	return openHandles(root, candidates, target)
++}
++
++func materialOpenError(cause error) error {
++	var typed *sourceMutationError
++	if errors.As(cause, &typed) {
++		return cause
++	}
++	return sourceError("source_authority_unavailable", cause)
++}
++
++func openHandles(root, candidates, candidate string) (*materialSnapshot, error) {
++	snapshot := &materialSnapshot{rootPath: root, candidateDir: candidates, candidatePath: candidate}
++	var err error
++	snapshot.root, err = openMaterialDir(root)
++	if err != nil {
++		return nil, materialOpenError(err)
++	}
++	snapshot.rootInfo, err = snapshot.root.Stat()
++	if err != nil {
++		return nil, closeMaterial(snapshot, sourceError("source_authority_unavailable", err))
++	}
++	snapshot.candidates, err = openMaterialDir(candidates)
++	if err != nil {
++		return nil, closeMaterial(snapshot, materialOpenError(err))
++	}
++	snapshot.candidateInfo, err = snapshot.candidates.Stat()
++	if err != nil {
++		return nil, closeMaterial(snapshot, sourceError("source_authority_unavailable", err))
++	}
++	leafInfo, err := os.Lstat(candidate)
++	if err != nil {
++		return nil, closeMaterial(snapshot, sourceError("source_authority_unavailable", err))
++	}
++	if leafInfo.Mode()&os.ModeSymlink != 0 || !leafInfo.IsDir() {
++		return nil, closeMaterial(snapshot, sourceError("source_authority_corrupt", fmt.Errorf("candidate path is not a directory")))
++	}
++	snapshot.candidate, err = openMaterialDir(candidate)
++	if err != nil {
++		return nil, closeMaterial(snapshot, materialOpenError(err))
++	}
++	snapshot.materialInfo, err = snapshot.candidate.Stat()
++	if err != nil {
++		return nil, closeMaterial(snapshot, sourceError("source_authority_unavailable", err))
++	}
++	if snapshot.rootInfo.Mode()&os.ModeSymlink != 0 || snapshot.candidateInfo.Mode()&os.ModeSymlink != 0 || snapshot.materialInfo.Mode()&os.ModeSymlink != 0 || !snapshot.rootInfo.IsDir() || !snapshot.candidateInfo.IsDir() || !snapshot.materialInfo.IsDir() {
++		return nil, closeMaterial(snapshot, sourceError("source_authority_corrupt", fmt.Errorf("material path is not a directory")))
++	}
++	return snapshot, nil
++}
++
++func closeHandle(handle **os.File) error {
++	if handle == nil || *handle == nil {
++		return nil
++	}
++	file := *handle
++	*handle = nil
++	return file.Close()
++}
++
++func closeMaterial(snapshot *materialSnapshot, cause error) error {
++	if snapshot == nil {
++		return cause
++	}
++	closeErr := errors.Join(closeHandle(&snapshot.root), closeHandle(&snapshot.candidates), closeHandle(&snapshot.candidate))
++	if closeErr == nil {
++		return cause
++	}
++	if cause == nil {
++		return sourceError("source_authority_unavailable", closeErr)
++	}
++	return sourceError("source_authority_unavailable", errors.Join(cause, closeErr))
++}
++
++func sameMaterial(left, right *materialSnapshot) bool {
++	if left == nil || right == nil || left.rootPath != right.rootPath || left.candidateDir != right.candidateDir || left.candidatePath != right.candidatePath {
++		return false
++	}
++	return os.SameFile(left.rootInfo, right.rootInfo) && os.SameFile(left.candidateInfo, right.candidateInfo) && os.SameFile(left.materialInfo, right.materialInfo)
++}
+diff --git a/internal/runtime/source/owner_material_open_unix.go b/internal/runtime/source/owner_material_open_unix.go
+new file mode 100644
+index 0000000..9cb7510
+--- /dev/null
++++ b/internal/runtime/source/owner_material_open_unix.go
+@@ -0,0 +1,27 @@
++//go:build !windows
++
++package source
++
++import (
++	"errors"
++	"fmt"
++	"os"
++
++	"golang.org/x/sys/unix"
++)
++
++func openMaterialDir(path string) (*os.File, error) {
++	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_NONBLOCK
++	fd, err := unix.Open(path, flags, 0)
++	if err != nil {
++		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
++			return nil, sourceError("source_authority_corrupt", err)
++		}
++		return nil, err
++	}
++	file := os.NewFile(uintptr(fd), path)
++	if file != nil {
++		return file, nil
++	}
++	return nil, errors.Join(fmt.Errorf("material directory handle is unavailable"), unix.Close(fd))
++}
+diff --git a/internal/runtime/source/owner_material_open_windows.go b/internal/runtime/source/owner_material_open_windows.go
+new file mode 100644
+index 0000000..0c8fa69
+--- /dev/null
++++ b/internal/runtime/source/owner_material_open_windows.go
+@@ -0,0 +1,25 @@
++//go:build windows
++
++package source
++
++import (
++	"errors"
++	"fmt"
++	"os"
++
++	"golang.org/x/sys/windows"
++)
++
++func openMaterialDir(path string) (*os.File, error) {
++	share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
++	flags := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT)
++	handle, err := windows.CreateFile(windows.StringToUTF16Ptr(path), 0, share, nil, windows.OPEN_EXISTING, flags, 0)
++	if err != nil {
++		return nil, err
++	}
++	file := os.NewFile(uintptr(handle), path)
++	if file != nil {
++		return file, nil
++	}
++	return nil, errors.Join(fmt.Errorf("material directory handle is unavailable"), windows.CloseHandle(handle))
++}
+diff --git a/internal/runtime/source/owner_material_test.go b/internal/runtime/source/owner_material_test.go
+new file mode 100644
+index 0000000..8ca6c1e
+--- /dev/null
++++ b/internal/runtime/source/owner_material_test.go
+@@ -0,0 +1,868 @@
++package source
++
++import (
++	"context"
++	"errors"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	storeiface "polaris/internal/store"
++)
++
++func TestCandidateMaterial(t *testing.T) {
++	owner, current, path, _ := materialFixture(t)
++	valid := storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchRestartDurableV1, Current: current}
++	got, err := owner.InspectCandidateMaterial(context.Background(), valid)
++	if err != nil || got.Current != current || got.CandidatePath != path {
++		t.Fatalf("material=%+v err=%v", got, err)
++	}
++
++	cases := []struct {
++		name   string
++		ctx    context.Context
++		owner  *Owner
++		branch storeiface.InitialSourceBranchResultV1
++		kind   string
++	}{
++		{name: "nil context", owner: owner, branch: valid, kind: "source_input_invalid"},
++		{name: "canceled", ctx: canceledContext(), owner: owner, branch: valid, kind: "source_authority_unavailable"},
++		{name: "nil owner", ctx: context.Background(), branch: valid, kind: "source_authority_unavailable"},
++		{name: "first boot", ctx: context.Background(), owner: owner, branch: storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchFirstBootV1}, kind: "source_input_invalid"},
++		{name: "corrupt branch", ctx: context.Background(), owner: owner, branch: storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchCorruptV1, Current: current}, kind: "source_input_invalid"},
++		{name: "malformed digest", ctx: context.Background(), owner: owner, branch: storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchRestartDurableV1, Current: storeiface.SourceAuthorityCurrentV1{CandidateRef: "bad", RootDigest: "bad"}}, kind: "source_input_invalid"},
++		{name: "zero current", ctx: context.Background(), owner: owner, branch: storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchRestartDurableV1}, kind: "source_input_invalid"},
++		{name: "mismatched refs", ctx: context.Background(), owner: owner, branch: storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchRestartDurableV1, Current: storeiface.SourceAuthorityCurrentV1{CandidateRef: current.CandidateRef, RootDigest: digestText("other")}}, kind: "source_input_invalid"},
++	}
++	for _, item := range cases {
++		t.Run(item.name, func(t *testing.T) {
++			ctx := item.ctx
++			if ctx == nil && item.name != "nil context" {
++				ctx = context.Background()
++			}
++			got, err := item.owner.InspectCandidateMaterial(ctx, item.branch)
++			if got != (CandidateMaterialV1{}) {
++				t.Fatalf("failure result=%+v", got)
++			}
++			assertMaterialError(t, err, item.kind)
++		})
++	}
++}
++
++func TestCandidateMaterialFailures(t *testing.T) {
++	t.Run("missing", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		if err := os.Chmod(path, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.RemoveAll(path); err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() { _ = unlockTree(root) })
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		assertMaterialError(t, err, "source_authority_unavailable")
++		if result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", result)
++		}
++	})
++	t.Run("writable file", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		file := filepath.Join(path, "file")
++		if err := os.Chmod(file, 0o600); err != nil {
++			t.Fatal(err)
++		}
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		assertMaterialError(t, err, "source_authority_corrupt")
++		if result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", result)
++		}
++		t.Cleanup(func() { _ = unlockTree(root) })
++	})
++	t.Run("writable root", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		if err := os.Chmod(path, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		assertMaterialError(t, err, "source_authority_corrupt")
++		if result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", result)
++		}
++		t.Cleanup(func() { _ = unlockTree(root) })
++	})
++	t.Run("wrong bytes", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		file := filepath.Join(path, "file")
++		if err := os.Chmod(path, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Chmod(file, 0o600); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(file, []byte("different"), 0o600); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Chmod(file, 0o444); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Chmod(path, 0o555); err != nil {
++			t.Fatal(err)
++		}
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		assertMaterialError(t, err, "source_authority_corrupt")
++		if result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", result)
++		}
++		t.Cleanup(func() { _ = unlockTree(root) })
++	})
++	t.Run("final symlink", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		outside := filepath.Join(root, "missing-outside")
++		if err := os.Chmod(path, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.RemoveAll(path); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(outside, path); err != nil {
++			t.Fatal(err)
++		}
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		assertMaterialError(t, err, "source_authority_corrupt")
++		if result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", result)
++		}
++	})
++	t.Run("in root symlink", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		outside := filepath.Join(root, "outside")
++		if err := os.Mkdir(outside, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Chmod(path, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.RemoveAll(path); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(outside, path); err != nil {
++			t.Fatal(err)
++		}
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		assertMaterialError(t, err, "source_authority_corrupt")
++		if result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", result)
++		}
++	})
++	t.Run("bad sibling ignored", func(t *testing.T) {
++		owner, current, path, root := materialFixture(t)
++		sibling := filepath.Join(filepath.Dir(path), strings.Repeat("b", 64))
++		outside := filepath.Join(root, "outside")
++		if err := os.Mkdir(outside, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(outside, sibling); err != nil {
++			t.Fatal(err)
++		}
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		if err != nil || result.CandidatePath != path {
++			t.Fatalf("sibling affected valid material=%+v err=%v", result, err)
++		}
++	})
++}
++
++func TestCandidateIdentity(t *testing.T) {
++	_, current, path, _ := materialFixture(t)
++	rootPath := filepath.Dir(filepath.Dir(path))
++	candidateDir := filepath.Dir(path)
++	pre, err := openHandles(rootPath, candidateDir, path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	post, err := openHandles(rootPath, candidateDir, path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !sameMaterial(pre, post) {
++		t.Fatal("unchanged handle identities differ")
++	}
++	alternates := []struct {
++		name string
++		set  func(*materialSnapshot, os.FileInfo)
++	}{
++		{name: "root", set: func(snapshot *materialSnapshot, info os.FileInfo) { snapshot.rootInfo = info }},
++		{name: "candidates", set: func(snapshot *materialSnapshot, info os.FileInfo) { snapshot.candidateInfo = info }},
++		{name: "candidate", set: func(snapshot *materialSnapshot, info os.FileInfo) { snapshot.materialInfo = info }},
++	}
++	for _, item := range alternates {
++		t.Run(item.name, func(t *testing.T) {
++			alternate := t.TempDir()
++			file, err := os.Open(alternate)
++			if err != nil {
++				t.Fatal(err)
++			}
++			info, err := file.Stat()
++			closeErr := file.Close()
++			if err != nil || closeErr != nil {
++				t.Fatalf("alternate stat=%v close=%v", err, closeErr)
++			}
++			item.set(post, info)
++			if sameMaterial(pre, post) {
++				t.Fatal("replaced handle identity accepted")
++			}
++			post.rootInfo = pre.rootInfo
++			post.candidateInfo = pre.candidateInfo
++			post.materialInfo = pre.materialInfo
++		})
++	}
++	if err := closeMaterial(pre, nil); err != nil {
++		t.Fatal(err)
++	}
++	if err := closeMaterial(post, nil); err != nil {
++		t.Fatal(err)
++	}
++	if current.CandidateRef == "" {
++		t.Fatal("fixture current missing")
++	}
++}
++
++func TestCandidateDTO(t *testing.T) {
++	typ := reflect.TypeOf(CandidateMaterialV1{})
++	wantCurrent := reflect.TypeOf(storeiface.SourceAuthorityCurrentV1{})
++	wantPath := reflect.TypeOf("")
++	if typ.NumField() != 2 || typ.Field(0).Name != "Current" || typ.Field(0).Type != wantCurrent || typ.Field(1).Name != "CandidatePath" || typ.Field(1).Type != wantPath || typ.Field(0).Tag != "" || typ.Field(1).Tag != "" {
++		t.Fatalf("unexpected DTO=%v", typ)
++	}
++}
++
++func TestCandidateFailure(t *testing.T) {
++	cause := errors.New("material cause")
++	result, err := materialFailure(cause)
++	if result != (CandidateMaterialV1{}) || !errors.Is(err, cause) {
++		t.Fatalf("failure result=%+v err=%v", result, err)
++	}
++	result, err = materialFailure(nil)
++	if result != (CandidateMaterialV1{}) {
++		t.Fatalf("nil failure result=%+v", result)
++	}
++	assertMaterialError(t, err, "source_authority_unavailable")
++}
++
++func materialFixture(t *testing.T) (*Owner, storeiface.SourceAuthorityCurrentV1, string, string) {
++	t.Helper()
++	root := t.TempDir()
++	candidates := filepath.Join(root, "candidates")
++	if err := os.Mkdir(candidates, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	staged := filepath.Join(candidates, "staged")
++	if err := os.Mkdir(staged, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(staged, "file"), []byte("candidate"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := chmodTree(staged, true); err != nil {
++		t.Fatal(err)
++	}
++	digest, err := treeDigest(staged, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(candidates, strings.TrimPrefix(digest, "sha256:"))
++	if err := os.Rename(staged, path); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = unlockTree(root) })
++	return &Owner{root: root}, storeiface.SourceAuthorityCurrentV1{CandidateRef: digest, RootDigest: digest}, path, root
++}
++
++func materialBranch(current storeiface.SourceAuthorityCurrentV1) storeiface.InitialSourceBranchResultV1 {
++	return storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchRestartDurableV1, Current: current}
++}
++
++func canceledContext() context.Context {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	return ctx
++}
++
++func assertMaterialError(t *testing.T, err error, kind string) {
++	t.Helper()
++	if err == nil {
++		t.Fatalf("expected %s", kind)
++	}
++	var typed *sourceMutationError
++	if !errors.As(err, &typed) || typed.Kind() != kind {
++		t.Fatalf("error=%v kind=%q want=%q", err, typed.Kind(), kind)
++	}
++}
++
++func TestCandidateClose(t *testing.T) {
++	file, err := os.Open(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	handle := file
++	if err := closeHandle(&handle); err != nil {
++		t.Fatal(err)
++	}
++	if handle != nil {
++		t.Fatal("closed handle retained")
++	}
++	if err := closeHandle(&handle); err != nil {
++		t.Fatal(err)
++	}
++	closed, err := os.Open(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := closed.Close(); err != nil {
++		t.Fatal(err)
++	}
++	primary := errors.New("primary material corruption")
++	closeErr := closeMaterial(&materialSnapshot{root: closed}, sourceError("source_authority_corrupt", primary))
++	assertMaterialError(t, closeErr, "source_authority_unavailable")
++	if !errors.Is(closeErr, primary) {
++		t.Fatalf("close error lost primary cause: %v", closeErr)
++	}
++}
++
++func TestCandidateMaterialShape(t *testing.T) {
++	fset := token.NewFileSet()
++	paths := []string{"owner_material.go", "owner_material_open_unix.go", "owner_material_open_windows.go"}
++	files := make(map[string]*ast.File, len(paths))
++	for _, path := range paths {
++		file, err := parser.ParseFile(fset, path, nil, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		files[path] = file
++		for _, declaration := range file.Decls {
++			if global, ok := declaration.(*ast.GenDecl); ok && global.Tok == token.VAR {
++				t.Fatalf("package-level mutable hook found in %s", path)
++			}
++		}
++	}
++	forbidden := map[string]bool{"WriteFile": true, "Rename": true, "Remove": true, "RemoveAll": true, "Chmod": true, "Walk": true, "WalkDir": true, "Glob": true, "ReadDir": true, "treeDigest": true, "plannedDigest": true, "Copy": true, "Capture": true, "Store": true, "Scanner": true}
++	for path, file := range files {
++		ast.Inspect(file, func(node ast.Node) bool {
++			call, ok := node.(*ast.CallExpr)
++			if !ok {
++				return true
++			}
++			if selector, ok := call.Fun.(*ast.SelectorExpr); ok {
++				if object, ok := selector.X.(*ast.Ident); ok && object.Name == "os" && (selector.Sel.Name == "Open" || selector.Sel.Name == "Root") {
++					t.Fatalf("forbidden generic os call %s in %s", selector.Sel.Name, path)
++				}
++			}
++			name := ""
++			switch function := call.Fun.(type) {
++			case *ast.Ident:
++				name = function.Name
++			case *ast.SelectorExpr:
++				name = function.Sel.Name
++			}
++			if forbidden[name] {
++				t.Fatalf("forbidden material call %s in %s", name, path)
++			}
++			return true
++		})
++	}
++	file := files["owner_material.go"]
++	var inspect *ast.FuncDecl
++	var opener *ast.FuncDecl
++	var handles *ast.FuncDecl
++	var failure *ast.FuncDecl
++	for _, declaration := range file.Decls {
++		function, ok := declaration.(*ast.FuncDecl)
++		if !ok {
++			continue
++		}
++		switch function.Name.Name {
++		case "InspectCandidateMaterial":
++			inspect = function
++		case "openMaterial":
++			opener = function
++		case "openHandles":
++			handles = function
++		case "materialFailure":
++			failure = function
++		}
++	}
++	if inspect == nil || opener == nil || handles == nil || failure == nil {
++		t.Fatal("material owner functions missing")
++	}
++	if !materialFailureShape(failure) {
++		t.Fatal("materialFailure must guard nil and return exact zero/cause")
++	}
++	openTargets, openHandles := 0, 0
++	ast.Inspect(opener.Body, func(node ast.Node) bool {
++		call, ok := node.(*ast.CallExpr)
++		if !ok {
++			return true
++		}
++		if calledName(call, "candidateTarget") {
++			openTargets++
++		}
++		if calledName(call, "openHandles") {
++			openHandles++
++		}
++		return true
++	})
++	if openTargets != 1 || openHandles != 1 {
++		t.Fatalf("snapshot admission target=%d handles=%d", openTargets, openHandles)
++	}
++	stats := map[string]int{"root": 0, "candidates": 0, "candidate": 0}
++	opens, lstat, openErrors := 0, 0, 0
++	ast.Inspect(handles.Body, func(node ast.Node) bool {
++		call, ok := node.(*ast.CallExpr)
++		if !ok {
++			return true
++		}
++		if isName(call.Fun, "openMaterialDir") {
++			opens++
++		}
++		if isName(call.Fun, "materialOpenError") {
++			openErrors++
++		}
++		selector, ok := call.Fun.(*ast.SelectorExpr)
++		if !ok {
++			return true
++		}
++		if selector.Sel.Name == "Lstat" {
++			lstat++
++			return true
++		}
++		if selector.Sel.Name != "Stat" {
++			return true
++		}
++		handle, ok := selector.X.(*ast.SelectorExpr)
++		if !ok || !isName(handle.X, "snapshot") {
++			return true
++		}
++		stats[handle.Sel.Name]++
++		return true
++	})
++	if stats["root"] != 1 || stats["candidates"] != 1 || stats["candidate"] != 1 || opens != 3 || openErrors != 3 || lstat != 1 {
++		t.Fatalf("snapshot handles stats=%v openMaterialDir=%d materialOpenError=%d lstat=%d", stats, opens, openErrors, lstat)
++	}
++	assign := map[string]int{"pre": 0, "post": 0, "verified": 0, "identity": 0}
++	body := inspect.Body.List
++	for _, statement := range body {
++		assignment, ok := statement.(*ast.AssignStmt)
++		if !ok || len(assignment.Lhs) != 2 || len(assignment.Rhs) != 1 {
++			continue
++		}
++		left, ok := assignment.Lhs[0].(*ast.Ident)
++		if !ok {
++			continue
++		}
++		call, ok := assignment.Rhs[0].(*ast.CallExpr)
++		if !ok || len(call.Args) == 0 {
++			continue
++		}
++		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && isName(selector.X, "o") {
++			argument, argumentOK := call.Args[0].(*ast.SelectorExpr)
++			if !argumentOK || !isName(argument.X, "current") || argument.Sel.Name != "CandidateRef" {
++				continue
++			}
++			switch selector.Sel.Name {
++			case "openMaterial":
++				if len(call.Args) == 1 && (left.Name == "pre" || left.Name == "post") {
++					assign[left.Name]++
++				}
++			case "verifyCandidate":
++				if left.Name == "verified" && len(call.Args) == 2 {
++					second, secondOK := call.Args[1].(*ast.SelectorExpr)
++					if secondOK && isName(second.X, "current") && second.Sel.Name == "RootDigest" {
++						assign["verified"]++
++					}
++				}
++			}
++		}
++	}
++	for _, statement := range body {
++		assignment, ok := statement.(*ast.AssignStmt)
++		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 || !isName(assignment.Lhs[0], "identityOK") {
++			continue
++		}
++		call, ok := assignment.Rhs[0].(*ast.CallExpr)
++		if ok && isName(call.Fun, "sameMaterial") && len(call.Args) == 2 && isName(call.Args[0], "pre") && isName(call.Args[1], "post") {
++			assign["identity"]++
++		}
++	}
++	infoAssign := map[string]int{"rootInfo": 0, "candidateInfo": 0, "materialInfo": 0}
++	ast.Inspect(handles.Body, func(node ast.Node) bool {
++		assignment, ok := node.(*ast.AssignStmt)
++		if !ok || len(assignment.Lhs) != 2 || len(assignment.Rhs) != 1 {
++			return true
++		}
++		left, ok := assignment.Lhs[0].(*ast.SelectorExpr)
++		if !ok || !isName(left.X, "snapshot") {
++			return true
++		}
++		call, ok := assignment.Rhs[0].(*ast.CallExpr)
++		if !ok {
++			return true
++		}
++		stat, ok := call.Fun.(*ast.SelectorExpr)
++		if !ok || stat.Sel.Name != "Stat" {
++			return true
++		}
++		handle, ok := stat.X.(*ast.SelectorExpr)
++		if !ok || !isName(handle.X, "snapshot") {
++			return true
++		}
++		if left.Sel.Name == "rootInfo" && handle.Sel.Name == "root" || left.Sel.Name == "candidateInfo" && handle.Sel.Name == "candidates" || left.Sel.Name == "materialInfo" && handle.Sel.Name == "candidate" {
++			infoAssign[left.Sel.Name]++
++		}
++		return true
++	})
++	if assign["pre"] != 1 || assign["post"] != 1 || assign["verified"] != 1 || assign["identity"] != 1 || infoAssign["rootInfo"] != 1 || infoAssign["candidateInfo"] != 1 || infoAssign["materialInfo"] != 1 {
++		t.Fatalf("dataflow assignments=%v info=%v", assign, infoAssign)
++	}
++	preIndex, verifyIndex := topMaterialAssign(body, "pre"), topVerifyAssign(body)
++	postIndex, identityIndex := topMaterialAssign(body, "post"), topIdentityAssign(body)
++	ctxIndexes := make([]int, 0, 3)
++	identityGate, preClose, postClose, resultIndex := -1, -1, -1, -1
++	for index, statement := range body {
++		if materialContextGuard(statement) {
++			ctxIndexes = append(ctxIndexes, index)
++		}
++		if materialIdentityGate(statement) {
++			identityGate = index
++		}
++		if target, ok := materialSuccessClose(statement); ok {
++			if target == "pre" {
++				preClose = index
++			} else if target == "post" {
++				postClose = index
++			}
++		}
++		if materialSuccessReturn(statement) {
++			resultIndex = index
++		}
++	}
++	if preIndex < 0 || verifyIndex < 0 || postIndex < 0 || identityIndex < 0 || len(ctxIndexes) != 3 || identityGate < 0 || preClose < 0 || postClose < 0 || resultIndex < 0 || !(ctxIndexes[0] < preIndex && preIndex < verifyIndex && verifyIndex < ctxIndexes[1] && ctxIndexes[1] < postIndex && postIndex < identityIndex && identityIndex < ctxIndexes[2] && ctxIndexes[2] < identityGate && identityGate < preClose && preClose < postClose && postClose < resultIndex) {
++		t.Fatalf("material spine pre=%d verify=%d ctx=%v post=%d identity=%d gate=%d closes=%d/%d result=%d", preIndex, verifyIndex, ctxIndexes, postIndex, identityIndex, identityGate, preClose, postClose, resultIndex)
++	}
++	nilCloses := map[string]int{"pre": 0, "post": 0}
++	ast.Inspect(inspect.Body, func(node ast.Node) bool {
++		call, ok := node.(*ast.CallExpr)
++		if !ok || !calledExpr(call.Fun, "closeMaterial") || len(call.Args) != 2 || !isName(call.Args[1], "nil") {
++			return true
++		}
++		if isName(call.Args[0], "pre") {
++			nilCloses["pre"]++
++		}
++		if isName(call.Args[0], "post") {
++			nilCloses["post"]++
++		}
++		return true
++	})
++	if nilCloses["pre"] != 1 || nilCloses["post"] != 1 {
++		t.Fatalf("success close calls=%v", nilCloses)
++	}
++	closeCounts := map[string]int{"pre": 0, "post": 0}
++	nonNilCounts := map[string]int{"pre": 0, "post": 0}
++	terminalCounts := map[string]int{"pre": 0, "post": 0}
++	ast.Inspect(inspect.Body, func(node ast.Node) bool {
++		call, ok := node.(*ast.CallExpr)
++		if !ok {
++			return true
++		}
++		if calledExpr(call.Fun, "closeHandle") {
++			t.Fatal("Inspect directly closes a material handle")
++		}
++		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "Close" {
++			t.Fatal("Inspect directly calls a Close method")
++		}
++		if !calledExpr(call.Fun, "closeMaterial") || len(call.Args) != 2 {
++			return true
++		}
++		if isName(call.Args[0], "pre") {
++			closeCounts["pre"]++
++		} else if isName(call.Args[0], "post") {
++			closeCounts["post"]++
++		}
++		if isName(call.Args[1], "nil") {
++			return true
++		}
++		if isName(call.Args[0], "pre") {
++			nonNilCounts["pre"]++
++		} else if isName(call.Args[0], "post") {
++			nonNilCounts["post"]++
++		}
++		return true
++	})
++	for _, statement := range body {
++		guard, ok := statement.(*ast.IfStmt)
++		if !ok || len(guard.Body.List) != 1 || !materialFailureReturn(guard.Body.List[0]) {
++			continue
++		}
++		ast.Inspect(guard.Body.List[0], func(node ast.Node) bool {
++			call, ok := node.(*ast.CallExpr)
++			if !ok || !calledExpr(call.Fun, "closeMaterial") || len(call.Args) != 2 || isName(call.Args[1], "nil") {
++				return true
++			}
++			if isName(call.Args[0], "pre") {
++				terminalCounts["pre"]++
++			} else if isName(call.Args[0], "post") {
++				terminalCounts["post"]++
++			}
++			return true
++		})
++	}
++	if closeCounts["pre"] != 6 || closeCounts["post"] != 4 || terminalCounts["pre"] != nonNilCounts["pre"] || terminalCounts["post"] != nonNilCounts["post"] {
++		t.Fatalf("close sites=%v nonnil=%v terminal=%v", closeCounts, nonNilCounts, terminalCounts)
++	}
++	returns := 0
++	successReturns := 0
++	var successPos token.Pos
++	ast.Inspect(inspect.Body, func(node ast.Node) bool {
++		statement, ok := node.(*ast.ReturnStmt)
++		if !ok {
++			return true
++		}
++		returns++
++		if materialSuccessReturn(statement) {
++			successReturns++
++			successPos = statement.Pos()
++			return true
++		}
++		if !materialFailureReturn(statement) {
++			t.Fatalf("non-zero error return at %v", statement.Pos())
++		}
++		return true
++	})
++	if returns == 0 || successReturns != 1 || successPos != body[resultIndex].Pos() {
++		t.Fatalf("material returns=%d success=%d successPos=%v resultPos=%v", returns, successReturns, successPos, body[resultIndex].Pos())
++	}
++}
++
++func calledName(call *ast.CallExpr, name string) bool {
++	switch function := call.Fun.(type) {
++	case *ast.Ident:
++		return function.Name == name
++	case *ast.SelectorExpr:
++		return function.Sel.Name == name
++	default:
++		return false
++	}
++}
++
++func topMaterialAssign(body []ast.Stmt, name string) int {
++	for index, statement := range body {
++		assignment, ok := statement.(*ast.AssignStmt)
++		if !ok || len(assignment.Lhs) != 2 || len(assignment.Rhs) != 1 || !isName(assignment.Lhs[0], name) {
++			continue
++		}
++		call, ok := assignment.Rhs[0].(*ast.CallExpr)
++		if !ok || !calledExpr(call.Fun, "openMaterial") || len(call.Args) != 1 {
++			continue
++		}
++		argument, ok := call.Args[0].(*ast.SelectorExpr)
++		if ok && isName(argument.X, "current") && argument.Sel.Name == "CandidateRef" {
++			return index
++		}
++	}
++	return -1
++}
++
++func topVerifyAssign(body []ast.Stmt) int {
++	for index, statement := range body {
++		assignment, ok := statement.(*ast.AssignStmt)
++		if !ok || len(assignment.Lhs) != 2 || len(assignment.Rhs) != 1 || !isName(assignment.Lhs[0], "verified") {
++			continue
++		}
++		call, ok := assignment.Rhs[0].(*ast.CallExpr)
++		if !ok || !calledExpr(call.Fun, "verifyCandidate") || len(call.Args) != 2 {
++			continue
++		}
++		first, firstOK := call.Args[0].(*ast.SelectorExpr)
++		second, secondOK := call.Args[1].(*ast.SelectorExpr)
++		if firstOK && secondOK && isName(first.X, "current") && first.Sel.Name == "CandidateRef" && isName(second.X, "current") && second.Sel.Name == "RootDigest" {
++			return index
++		}
++	}
++	return -1
++}
++
++func topIdentityAssign(body []ast.Stmt) int {
++	for index, statement := range body {
++		assignment, ok := statement.(*ast.AssignStmt)
++		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 || !isName(assignment.Lhs[0], "identityOK") {
++			continue
++		}
++		call, ok := assignment.Rhs[0].(*ast.CallExpr)
++		if ok && calledExpr(call.Fun, "sameMaterial") && len(call.Args) == 2 && isName(call.Args[0], "pre") && isName(call.Args[1], "post") {
++			return index
++		}
++	}
++	return -1
++}
++
++func materialContextGuard(statement ast.Stmt) bool {
++	guard, ok := statement.(*ast.IfStmt)
++	if !ok {
++		return false
++	}
++	assignment, ok := guard.Init.(*ast.AssignStmt)
++	if !ok || len(assignment.Lhs) != 1 || !isName(assignment.Lhs[0], "err") || len(assignment.Rhs) != 1 {
++		return false
++	}
++	call, ok := assignment.Rhs[0].(*ast.CallExpr)
++	if !ok || len(call.Args) != 0 {
++		return false
++	}
++	selector, ok := call.Fun.(*ast.SelectorExpr)
++	if !ok || !isName(selector.X, "ctx") || selector.Sel.Name != "Err" {
++		return false
++	}
++	condition, ok := guard.Cond.(*ast.BinaryExpr)
++	if !ok || condition.Op != token.NEQ || !isName(condition.X, "err") || !isName(condition.Y, "nil") {
++		return false
++	}
++	return len(guard.Body.List) == 1 && materialFailureReturn(guard.Body.List[0])
++}
++
++func materialIdentityGate(statement ast.Stmt) bool {
++	gate, ok := statement.(*ast.IfStmt)
++	if !ok || len(gate.Body.List) != 1 {
++		return false
++	}
++	not, ok := gate.Cond.(*ast.UnaryExpr)
++	return ok && not.Op == token.NOT && isName(not.X, "identityOK") && materialFailureReturn(gate.Body.List[0])
++}
++
++func materialSuccessClose(statement ast.Stmt) (string, bool) {
++	gate, ok := statement.(*ast.IfStmt)
++	if !ok || len(gate.Body.List) != 1 || !materialFailureReturn(gate.Body.List[0]) {
++		return "", false
++	}
++	assignment, ok := gate.Init.(*ast.AssignStmt)
++	if !ok || len(assignment.Lhs) != 1 || !isName(assignment.Lhs[0], "err") || len(assignment.Rhs) != 1 {
++		return "", false
++	}
++	call, ok := assignment.Rhs[0].(*ast.CallExpr)
++	if !ok || !calledExpr(call.Fun, "closeMaterial") || len(call.Args) != 2 || !isName(call.Args[1], "nil") {
++		return "", false
++	}
++	if isName(call.Args[0], "pre") {
++		return "pre", true
++	}
++	if isName(call.Args[0], "post") {
++		return "post", true
++	}
++	return "", false
++}
++
++func materialSuccessReturn(statement ast.Stmt) bool {
++	returnValue, ok := statement.(*ast.ReturnStmt)
++	if !ok || len(returnValue.Results) != 2 {
++		return false
++	}
++	literal, ok := returnValue.Results[0].(*ast.CompositeLit)
++	if !ok || !isName(literal.Type, "CandidateMaterialV1") || !isName(returnValue.Results[1], "nil") || len(literal.Elts) != 2 {
++		return false
++	}
++	fields := map[string]bool{}
++	for _, element := range literal.Elts {
++		keyed, ok := element.(*ast.KeyValueExpr)
++		if !ok {
++			return false
++		}
++		switch {
++		case isName(keyed.Key, "Current") && isName(keyed.Value, "current"):
++			fields["Current"] = true
++		case isName(keyed.Key, "CandidatePath") && isName(keyed.Value, "verified"):
++			fields["CandidatePath"] = true
++		default:
++			return false
++		}
++	}
++	return fields["Current"] && fields["CandidatePath"]
++}
++
++func materialFailureReturn(statement ast.Stmt) bool {
++	returnValue, ok := statement.(*ast.ReturnStmt)
++	if !ok || len(returnValue.Results) != 1 {
++		return false
++	}
++	returnValueCall, ok := returnValue.Results[0].(*ast.CallExpr)
++	return ok && calledExpr(returnValueCall.Fun, "materialFailure") && len(returnValueCall.Args) == 1
++}
++
++func materialFailureShape(function *ast.FuncDecl) bool {
++	if function == nil || function.Body == nil || len(function.Body.List) != 2 {
++		return false
++	}
++	guard, ok := function.Body.List[0].(*ast.IfStmt)
++	if !ok || guard.Init != nil || len(guard.Body.List) != 1 {
++		return false
++	}
++	condition, ok := guard.Cond.(*ast.BinaryExpr)
++	if !ok || condition.Op != token.EQL || !isName(condition.X, "cause") || !isName(condition.Y, "nil") {
++		return false
++	}
++	ifStatement, ok := guard.Body.List[0].(*ast.AssignStmt)
++	if !ok || len(ifStatement.Lhs) != 1 || !isName(ifStatement.Lhs[0], "cause") || len(ifStatement.Rhs) != 1 {
++		return false
++	}
++	returnValue, ok := function.Body.List[1].(*ast.ReturnStmt)
++	if !ok || len(returnValue.Results) != 2 || !isName(returnValue.Results[1], "cause") {
++		return false
++	}
++	literal, ok := returnValue.Results[0].(*ast.CompositeLit)
++	return ok && isName(literal.Type, "CandidateMaterialV1") && len(literal.Elts) == 0
++}
++
++func calledExpr(expression ast.Expr, name string) bool {
++	switch function := expression.(type) {
++	case *ast.Ident:
++		return function.Name == name
++	case *ast.SelectorExpr:
++		return function.Sel.Name == name
++	default:
++		return false
++	}
++}
++
++func flagTree(expression ast.Expr, object string) (map[string]int, bool) {
++	counts := make(map[string]int)
++	var visit func(ast.Expr) bool
++	visit = func(expression ast.Expr) bool {
++		switch expression := expression.(type) {
++		case *ast.BinaryExpr:
++			if expression.Op != token.OR {
++				return false
++			}
++			return visit(expression.X) && visit(expression.Y)
++		case *ast.SelectorExpr:
++			if !isName(expression.X, object) || expression.Sel.Name == "" {
++				return false
++			}
++			counts[expression.Sel.Name]++
++			return true
++		default:
++			return false
++		}
++	}
++	return counts, visit(expression)
++}
++
++func isName(expression ast.Expr, name string) bool {
++	identifier, ok := expression.(*ast.Ident)
++	return ok && identifier.Name == name
++}
++
++func isLiteral(expression ast.Expr, value string) bool {
++	literal, ok := expression.(*ast.BasicLit)
++	return ok && literal.Value == value
++}
+diff --git a/internal/runtime/source/owner_material_unix_test.go b/internal/runtime/source/owner_material_unix_test.go
+new file mode 100644
+index 0000000..f8763c1
+--- /dev/null
++++ b/internal/runtime/source/owner_material_unix_test.go
+@@ -0,0 +1,200 @@
++//go:build !windows
++
++package source
++
++import (
++	"context"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestCandidateMaterialFIFO(t *testing.T) {
++	owner, current, path, _ := materialFixture(t)
++	if err := os.Chmod(path, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.RemoveAll(path); err != nil {
++		t.Fatal(err)
++	}
++	if err := syscall.Mkfifo(path, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	type outcome struct {
++		result CandidateMaterialV1
++		err    error
++	}
++	channel := make(chan outcome, 1)
++	go func() {
++		result, err := owner.InspectCandidateMaterial(context.Background(), materialBranch(current))
++		channel <- outcome{result: result, err: err}
++	}()
++	select {
++	case got := <-channel:
++		assertMaterialError(t, got.err, "source_authority_corrupt")
++		if got.result != (CandidateMaterialV1{}) {
++			t.Fatalf("failure result=%+v", got.result)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("FIFO admission blocked")
++	}
++}
++
++func TestCandidateUnixFlags(t *testing.T) {
++	file, err := parser.ParseFile(token.NewFileSet(), "owner_material_open_unix.go", nil, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var function *ast.FuncDecl
++	for _, declaration := range file.Decls {
++		candidate, ok := declaration.(*ast.FuncDecl)
++		if ok && candidate.Name.Name == "openMaterialDir" {
++			function = candidate
++		}
++	}
++	if function == nil {
++		t.Fatal("openMaterialDir missing")
++	}
++	flags := map[string]int{}
++	openFound, newFile, closeFound := false, false, false
++	flagsAssignments, newFileAssignments := 0, 0
++	successReturn, rawCloseCalls, rawCloseReturn := 0, 0, 0
++	flagsPos, openPos := token.NoPos, token.NoPos
++	fileIf, closePos, returnClosePos := token.NoPos, token.NoPos, token.NoPos
++	ast.Inspect(function.Body, func(node ast.Node) bool {
++		statement, ok := node.(*ast.AssignStmt)
++		if ok && len(statement.Lhs) == 1 && isName(statement.Lhs[0], "flags") && len(statement.Rhs) == 1 {
++			flagsAssignments++
++			flagsPos = statement.Pos()
++			var valid bool
++			flags, valid = flagTree(statement.Rhs[0], "unix")
++			if !valid {
++				t.Fatal("flags are not a pure Unix OR tree")
++			}
++		}
++		if ok && len(statement.Lhs) == 1 && isName(statement.Lhs[0], "file") && len(statement.Rhs) == 1 {
++			newFileAssignments++
++		}
++		call, ok := node.(*ast.CallExpr)
++		if !ok {
++			return true
++		}
++		selector, ok := call.Fun.(*ast.SelectorExpr)
++		if ok && isName(selector.X, "unix") && selector.Sel.Name == "Open" && len(call.Args) == 3 && isName(call.Args[0], "path") && isName(call.Args[1], "flags") && isLiteral(call.Args[2], "0") {
++			openFound = true
++			openPos = call.Pos()
++		}
++		if ok && isName(selector.X, "os") && selector.Sel.Name == "NewFile" && len(call.Args) == 2 {
++			if callArg, ok := call.Args[0].(*ast.CallExpr); ok {
++				if fn, ok := callArg.Fun.(*ast.Ident); ok && fn.Name == "uintptr" && len(callArg.Args) == 1 && isName(callArg.Args[0], "fd") && isName(call.Args[1], "path") {
++					newFile = true
++				}
++			}
++		}
++		if ok && isName(selector.X, "unix") && selector.Sel.Name == "Close" && len(call.Args) == 1 && isName(call.Args[0], "fd") {
++			closeFound = true
++			rawCloseCalls++
++			closePos = call.Pos()
++		}
++		return true
++	})
++	for _, statement := range function.Body.List {
++		guard, ok := statement.(*ast.IfStmt)
++		if !ok {
++			continue
++		}
++		condition, ok := guard.Cond.(*ast.BinaryExpr)
++		if ok && condition.Op == token.NEQ && isName(condition.X, "file") && isName(condition.Y, "nil") {
++			fileIf = guard.Pos()
++			if len(guard.Body.List) == 1 {
++				if result, ok := guard.Body.List[0].(*ast.ReturnStmt); ok && len(result.Results) == 2 && isName(result.Results[0], "file") && isName(result.Results[1], "nil") {
++					successReturn++
++				}
++			}
++		}
++	}
++	for _, statement := range function.Body.List {
++		result, ok := statement.(*ast.ReturnStmt)
++		if !ok {
++			continue
++		}
++		ast.Inspect(result, func(node ast.Node) bool {
++			call, ok := node.(*ast.CallExpr)
++			if !ok {
++				return true
++			}
++			selector, selectorOK := call.Fun.(*ast.SelectorExpr)
++			if ok && selectorOK && isName(selector.X, "unix") && selector.Sel.Name == "Close" {
++				rawCloseReturn++
++				returnClosePos = call.Pos()
++			}
++			return true
++		})
++	}
++	want := map[string]bool{"O_RDONLY": true, "O_CLOEXEC": true, "O_DIRECTORY": true, "O_NOFOLLOW": true, "O_NONBLOCK": true}
++	if len(flags) != len(want) || !openFound || !newFile || !closeFound || flagsAssignments != 1 || newFileAssignments != 1 || successReturn != 1 || rawCloseCalls != 1 || rawCloseReturn != 1 || fileIf == token.NoPos {
++		t.Fatalf("flags=%v open=%v newFile=%v close=%v flagAssignments=%d fileAssignments=%d success=%d rawClose=%d/%d", flags, openFound, newFile, closeFound, flagsAssignments, newFileAssignments, successReturn, rawCloseCalls, rawCloseReturn)
++	}
++	for name := range want {
++		if flags[name] != 1 {
++			t.Fatalf("missing Unix flag %s", name)
++		}
++	}
++	if flagsPos == token.NoPos || openPos == token.NoPos || flagsPos >= openPos || closePos <= fileIf || returnClosePos != closePos {
++		t.Fatalf("raw open/close control-flow flags=%v open=%v fileIf=%v close=%v returnClose=%v", flagsPos, openPos, fileIf, closePos, returnClosePos)
++	}
++}
++
++func TestCandidateUnixOpen(t *testing.T) {
++	root := t.TempDir()
++	regular := filepath.Join(root, "regular")
++	if err := os.WriteFile(regular, []byte("x"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	link := filepath.Join(root, "link")
++	if err := os.Symlink(regular, link); err != nil {
++		t.Fatal(err)
++	}
++	fifo := filepath.Join(root, "fifo")
++	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	cases := []struct {
++		name string
++		path string
++		kind string
++	}{
++		{name: "symlink", path: link, kind: "source_authority_corrupt"},
++		{name: "regular", path: regular, kind: "source_authority_corrupt"},
++		{name: "missing", path: filepath.Join(root, "missing"), kind: "source_authority_unavailable"},
++		{name: "fifo", path: fifo, kind: "source_authority_corrupt"},
++	}
++	for _, item := range cases {
++		t.Run(item.name, func(t *testing.T) {
++			type outcome struct {
++				file *os.File
++				err  error
++			}
++			channel := make(chan outcome, 1)
++			go func() {
++				file, err := openMaterialDir(item.path)
++				channel <- outcome{file: file, err: err}
++			}()
++			select {
++			case got := <-channel:
++				if got.file != nil {
++					_ = got.file.Close()
++					t.Fatal("special path opened")
++				}
++				assertMaterialError(t, materialOpenError(got.err), item.kind)
++			case <-time.After(time.Second):
++				t.Fatal("special path admission blocked")
++			}
++		})
++	}
++}
+diff --git a/internal/runtime/source/owner_material_windows_test.go b/internal/runtime/source/owner_material_windows_test.go
+new file mode 100644
+index 0000000..0553a97
+--- /dev/null
++++ b/internal/runtime/source/owner_material_windows_test.go
+@@ -0,0 +1,192 @@
++//go:build windows
++
++package source
++
++import (
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestCandidateMaterialWindows(t *testing.T) {
++	root := t.TempDir()
++	candidates := filepath.Join(root, "candidates")
++	candidate := filepath.Join(candidates, "candidate")
++	if err := os.Mkdir(candidates, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(candidate, 0o500); err != nil {
++		t.Fatal(err)
++	}
++	pre, err := openHandles(root, candidates, candidate)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if pre.rootInfo == nil || pre.candidateInfo == nil || pre.materialInfo == nil {
++		t.Fatal("File.Stat identity was not captured")
++	}
++	old := candidate + "-old"
++	if err := closeMaterial(pre, nil); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Rename(candidate, old); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(candidate, 0o500); err != nil {
++		t.Fatal(err)
++	}
++	post, err := openHandles(root, candidates, candidate)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if sameMaterial(pre, post) {
++		t.Fatal("replacement identity accepted")
++	}
++	if err := closeMaterial(post, nil); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestCandidateWindowsFlags(t *testing.T) {
++	file, err := parser.ParseFile(token.NewFileSet(), "owner_material_open_windows.go", nil, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var function *ast.FuncDecl
++	for _, declaration := range file.Decls {
++		candidate, ok := declaration.(*ast.FuncDecl)
++		if ok && candidate.Name.Name == "openMaterialDir" {
++			function = candidate
++		}
++	}
++	if function == nil {
++		t.Fatal("openMaterialDir missing")
++	}
++	share, flags := map[string]int{}, map[string]int{}
++	create, newFile, closeHandle := false, false, false
++	shareAssignments, flagAssignments, newFileAssignments := 0, 0, 0
++	successReturn, rawCloseCalls, closeInReturn := 0, 0, 0
++	sharePos, flagPos, createPos := token.NoPos, token.NoPos, token.NoPos
++	fileIf, closePos, returnClosePos := token.NoPos, token.NoPos, token.NoPos
++	ast.Inspect(function.Body, func(node ast.Node) bool {
++		statement, ok := node.(*ast.AssignStmt)
++		if ok && len(statement.Lhs) == 1 && len(statement.Rhs) == 1 {
++			if isName(statement.Lhs[0], "share") {
++				shareAssignments++
++				sharePos = statement.Pos()
++				var valid bool
++				share, valid = flagTree(unwrapUint32(statement.Rhs[0]), "windows")
++				if !valid {
++					t.Fatal("share flags are not a pure Windows OR tree")
++				}
++			}
++			if isName(statement.Lhs[0], "flags") {
++				flagAssignments++
++				flagPos = statement.Pos()
++				var valid bool
++				flags, valid = flagTree(unwrapUint32(statement.Rhs[0]), "windows")
++				if !valid {
++					t.Fatal("open flags are not a pure Windows OR tree")
++				}
++			}
++		}
++		if ok && len(statement.Lhs) == 1 && isName(statement.Lhs[0], "file") && len(statement.Rhs) == 1 {
++			newFileAssignments++
++		}
++		call, ok := node.(*ast.CallExpr)
++		if !ok {
++			return true
++		}
++		selector, ok := call.Fun.(*ast.SelectorExpr)
++		if !ok {
++			return true
++		}
++		if isName(selector.X, "windows") && selector.Sel.Name == "CreateFile" && len(call.Args) == 7 {
++			first, firstOK := call.Args[0].(*ast.CallExpr)
++			firstFn, fnOK := first.Fun.(*ast.SelectorExpr)
++			create = firstOK && fnOK && isName(firstFn.X, "windows") && firstFn.Sel.Name == "StringToUTF16Ptr" && len(first.Args) == 1 && isName(first.Args[0], "path") && isLiteral(call.Args[1], "0") && isName(call.Args[2], "share") && isName(call.Args[3], "nil") && isSelector(call.Args[4], "windows", "OPEN_EXISTING") && isName(call.Args[5], "flags") && isLiteral(call.Args[6], "0")
++			createPos = call.Pos()
++		}
++		if isName(selector.X, "os") && selector.Sel.Name == "NewFile" && len(call.Args) == 2 {
++			first, firstOK := call.Args[0].(*ast.CallExpr)
++			firstFn, fnOK := first.Fun.(*ast.Ident)
++			newFile = firstOK && fnOK && firstFn.Name == "uintptr" && len(first.Args) == 1 && isName(first.Args[0], "handle") && isName(call.Args[1], "path")
++		}
++		if isName(selector.X, "windows") && selector.Sel.Name == "CloseHandle" && len(call.Args) == 1 && isName(call.Args[0], "handle") {
++			closeHandle = true
++			rawCloseCalls++
++			closePos = call.Pos()
++		}
++		return true
++	})
++	for _, statement := range function.Body.List {
++		guard, ok := statement.(*ast.IfStmt)
++		if !ok {
++			continue
++		}
++		condition, ok := guard.Cond.(*ast.BinaryExpr)
++		if !ok || condition.Op != token.NEQ || !isName(condition.X, "file") || !isName(condition.Y, "nil") {
++			continue
++		}
++		fileIf = guard.Pos()
++		if len(guard.Body.List) != 1 {
++			continue
++		}
++		result, ok := guard.Body.List[0].(*ast.ReturnStmt)
++		if ok && len(result.Results) == 2 && isName(result.Results[0], "file") && isName(result.Results[1], "nil") {
++			successReturn++
++		}
++	}
++	for _, statement := range function.Body.List {
++		result, ok := statement.(*ast.ReturnStmt)
++		if !ok {
++			continue
++		}
++		ast.Inspect(result, func(node ast.Node) bool {
++			call, ok := node.(*ast.CallExpr)
++			if !ok {
++				return true
++			}
++			selector, selectorOK := call.Fun.(*ast.SelectorExpr)
++			if ok && selectorOK && isName(selector.X, "windows") && selector.Sel.Name == "CloseHandle" {
++				closeInReturn++
++				returnClosePos = call.Pos()
++			}
++			return true
++		})
++	}
++	wantShare := map[string]bool{"FILE_SHARE_READ": true, "FILE_SHARE_WRITE": true, "FILE_SHARE_DELETE": true}
++	wantFlags := map[string]bool{"FILE_FLAG_BACKUP_SEMANTICS": true, "FILE_FLAG_OPEN_REPARSE_POINT": true}
++	if !create || !newFile || !closeHandle || shareAssignments != 1 || flagAssignments != 1 || newFileAssignments != 1 || successReturn != 1 || rawCloseCalls != 1 || closeInReturn != 1 || closePos <= fileIf || returnClosePos != closePos || sharePos == token.NoPos || flagPos == token.NoPos || createPos == token.NoPos || sharePos >= createPos || flagPos >= createPos || len(share) != len(wantShare) || len(flags) != len(wantFlags) {
++		t.Fatalf("share=%v flags=%v create=%v newFile=%v close=%v assignments=%d/%d/%d success=%d rawClose=%d returnClose=%d positions=%v/%v/%v", share, flags, create, newFile, closeHandle, shareAssignments, flagAssignments, newFileAssignments, successReturn, rawCloseCalls, closeInReturn, sharePos, flagPos, createPos)
++	}
++	for name := range wantShare {
++		if share[name] != 1 {
++			t.Fatalf("missing Windows share flag %s", name)
++		}
++	}
++	for name := range wantFlags {
++		if flags[name] != 1 {
++			t.Fatalf("missing Windows open flag %s", name)
++		}
++	}
++}
++
++func unwrapUint32(expression ast.Expr) ast.Expr {
++	call, ok := expression.(*ast.CallExpr)
++	if !ok || len(call.Args) != 1 || !isName(call.Fun, "uint32") {
++		return nil
++	}
++	return call.Args[0]
++}
++
++func isSelector(expression ast.Expr, object, name string) bool {
++	selector, ok := expression.(*ast.SelectorExpr)
++	if !ok {
++		return false
++	}
++	return isName(selector.X, object) && selector.Sel.Name == name
++}

@@ -1,5 +1,7 @@
 # polaris-bootstrap-log
 
+> **2026-09-07 continuation / 续接批次**：新增 [8 月 25 日至 9 月 2 日证据批次](batches/2026-09-07-continuation/README.md)：399 条提交元数据、三个重点事件、原始代码差异与历史封存记录。它不是全量会话续传；不沿用下文历史批次的“零人工技术干预”断言。发布规则见 [PUBLICATION.md](PUBLICATION.md)。下文保留为原批次介绍。
+
 A public, evidence-first record of an AI system building itself.
 
 This repository documents **Polaris** (北极星) — a Go task-governance platform — during a zero-human-intervention development run that started 2026-08-23 23:30 CST. A Codex-based "Prime" agent scheduled parallel worker agents ("luna"), reviewed every line, and ran under a frozen constitution (`AGENTS.md`, 860 lines) plus 44 mechanical invariant gates.

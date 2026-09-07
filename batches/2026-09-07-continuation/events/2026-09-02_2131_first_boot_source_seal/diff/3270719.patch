@@ -1,0 +1,2317 @@
+diff --git a/cmd/gateway/bootstrap_source.go b/cmd/gateway/bootstrap_source.go
+index 4bfa30f..c31bd7e 100644
+--- a/cmd/gateway/bootstrap_source.go
++++ b/cmd/gateway/bootstrap_source.go
+@@ -10,6 +10,8 @@ import (
+ 	"unicode"
+ 	"unicode/utf8"
+ 
++	intentinventory "polaris/internal/application/intentinventory"
++	sourcecapture "polaris/internal/application/sourcecapture"
+ 	"polaris/internal/config"
+ 	sourceowner "polaris/internal/runtime/source"
+ 	storeiface "polaris/internal/store"
+@@ -29,6 +31,87 @@ type materialInspector interface {
+ 	InspectCandidateMaterial(context.Context, storeiface.InitialSourceBranchResultV1) (sourceowner.CandidateMaterialV1, error)
+ }
+ 
++type initialCapture struct {
++	report intentinventory.CaptureReportV1
++}
++
++func (c initialCapture) capture(ctx context.Context, input sourceowner.InitialCaptureInput) (sourceowner.SourceCaptureV1, error) {
++	if ctx == nil {
++		return sourceowner.SourceCaptureV1{}, fmt.Errorf("initial source capture context is nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return sourceowner.SourceCaptureV1{}, err
++	}
++	report, err := intentinventory.ProduceCapture(ctx, input.StagingPath)
++	if err != nil {
++		return sourceowner.SourceCaptureV1{}, fmt.Errorf("initial source capture: %w", err)
++	}
++	if report.WorldDigest != c.report.WorldDigest || !reflect.DeepEqual(report.Inventory, c.report.Inventory) {
++		return sourceowner.SourceCaptureV1{}, fmt.Errorf("initial source capture differs from pre-capture")
++	}
++	captured, err := sourcecapture.BuildCapture(report, input.QuiescenceRef)
++	if err != nil {
++		return sourceowner.SourceCaptureV1{}, fmt.Errorf("initial source capture build: %w", err)
++	}
++	return captured, nil
++}
++
++func copyReport(report intentinventory.CaptureReportV1) intentinventory.CaptureReportV1 {
++	report.Inventory.StateRefs = append([]string(nil), report.Inventory.StateRefs...)
++	report.Inventory.SourceRefs = append([]string(nil), report.Inventory.SourceRefs...)
++	return report
++}
++
++func promoteSource(start sessionStart, current0 storeiface.RuntimeSessionSnapshotV1) error {
++	pre := start.process.Lease.PreCapture
++	lookup := storeiface.SourceAuthorityLookupV1{StoreRef: pre.Source.Ingress.StoreRef}
++	branch, err := start.store.InspectInitialSourceBranch(start.lifecycle, lookup)
++	if err != nil {
++		return fmt.Errorf("gateway source promotion branch: %w", err)
++	}
++	if branch != pre.Source.Branch {
++		return fmt.Errorf("gateway source promotion branch differs from pre-capture")
++	}
++	switch branch.Kind {
++	case storeiface.InitialSourceBranchFirstBootV1:
++		if branch.Current != (storeiface.SourceAuthorityCurrentV1{}) {
++			return fmt.Errorf("gateway source promotion first boot current is not zero")
++		}
++		preReport := copyReport(pre.Report)
++		capture := initialCapture{report: preReport}
++		input := sourceowner.SourceBootstrap{
++			StoreRef:   pre.Source.Ingress.StoreRef,
++			WriterRef:  current0.Lease.OwnerRef,
++			Lease:      current0.Lease,
++			Lifecycle:  current0.LeaseLifecycle,
++			SourceRoot: pre.Source.MaterialPath,
++			Capture:    capture.capture,
++		}
++		registered, err := start.owner.RegisterInitialCandidate(start.lifecycle, input)
++		if err != nil {
++			return fmt.Errorf("gateway source promotion register: %w", err)
++		}
++		after, err := start.store.InspectInitialSourceBranch(start.lifecycle, lookup)
++		if err != nil {
++			return fmt.Errorf("gateway source promotion readback: %w", err)
++		}
++		want := storeiface.InitialSourceBranchResultV1{
++			Kind:    storeiface.InitialSourceBranchRestartDurableV1,
++			Current: registered,
++		}
++		if after != want {
++			return fmt.Errorf("gateway source promotion readback differs")
++		}
++	case storeiface.InitialSourceBranchRestartDurableV1:
++		if !strictCurrent(branch.Current) {
++			return fmt.Errorf("gateway source promotion restart current is invalid")
++		}
++	default:
++		return fmt.Errorf("gateway source promotion branch is closed")
++	}
++	return nil
++}
++
+ func composeSource(ctx context.Context, initial initialInspector, material materialInspector, ingress gatewayBootstrapIngressV1) (bootstrapSource, error) {
+ 	zero := bootstrapSource{}
+ 	if ctx == nil {
+diff --git a/cmd/gateway/bootstrap_source_test.go b/cmd/gateway/bootstrap_source_test.go
+index ec9a1ba..10207d5 100644
+--- a/cmd/gateway/bootstrap_source_test.go
++++ b/cmd/gateway/bootstrap_source_test.go
+@@ -328,45 +328,61 @@ func TestBootstrapSourceDTO(t *testing.T) {
+ }
+ 
+ type sourceSite struct {
+-	path  string
+-	fn    *ast.FuncDecl
+-	call  *ast.CallExpr
+-	line  int
+-	value bool
++	path     string
++	fn       *ast.FuncDecl
++	selector *ast.SelectorExpr
++	call     *ast.CallExpr
++	line     int
++	depth    int
++	value    bool
++	nested   bool
++}
++
++type siteFrame struct {
++	funcLit bool
++	call    bool
+ }
+ 
+ type siteWalk struct {
+-	method string
+-	path   string
+-	fn     *ast.FuncDecl
+-	set    *token.FileSet
+-	calls  map[*ast.SelectorExpr]*ast.CallExpr
+-	depth  int
+-	stack  []bool
+-	sites  *[]sourceSite
++	method    string
++	path      string
++	fn        *ast.FuncDecl
++	set       *token.FileSet
++	calls     map[*ast.SelectorExpr]*ast.CallExpr
++	depth     int
++	callDepth int
++	stack     []siteFrame
++	sites     *[]sourceSite
+ }
+ 
+ func (w *siteWalk) Visit(node ast.Node) ast.Visitor {
+ 	if node == nil {
+ 		last := len(w.stack) - 1
+ 		if last >= 0 {
+-			if w.stack[last] {
++			if w.stack[last].funcLit {
+ 				w.depth--
+ 			}
++			if w.stack[last].call {
++				w.callDepth--
++			}
+ 			w.stack = w.stack[:last]
+ 		}
+ 		return w
+ 	}
+-	funcLit := false
++	frame := siteFrame{}
+ 	if _, ok := node.(*ast.FuncLit); ok {
+-		funcLit = true
++		frame.funcLit = true
+ 		w.depth++
+ 	}
+-	w.stack = append(w.stack, funcLit)
++	if _, ok := node.(*ast.CallExpr); ok {
++		frame.call = true
++		w.callDepth++
++	}
++	w.stack = append(w.stack, frame)
+ 	selector, ok := node.(*ast.SelectorExpr)
+ 	if ok && selector.Sel.Name == w.method {
+ 		call := w.calls[selector]
+-		*w.sites = append(*w.sites, sourceSite{path: w.path, fn: w.fn, call: call, line: w.set.Position(selector.Pos()).Line, value: w.depth > 0 || call == nil})
++		*w.sites = append(*w.sites, sourceSite{path: w.path, fn: w.fn, selector: selector, call: call, line: w.set.Position(selector.Pos()).Line, depth: w.depth, value: w.depth > 0 || call == nil, nested: w.callDepth > 1})
+ 	}
+ 	return w
+ }
+@@ -381,7 +397,7 @@ func TestBootstrapSourceStatic(t *testing.T) {
+ 	checkFlow(t, root)
+ }
+ 
+-func TestBootstrapSourceInitialCaptureCallerZero(t *testing.T) {
++func TestBootstrapSourceInitialCaptureCallerOne(t *testing.T) {
+ 	_, file, _, ok := runtime.Caller(0)
+ 	if !ok {
+ 		t.Fatal("runtime caller unavailable")
+@@ -392,16 +408,124 @@ func TestBootstrapSourceInitialCaptureCallerZero(t *testing.T) {
+ 
+ func checkCaptureCallers(t *testing.T, root string) {
+ 	t.Helper()
++	files, err := scanCaptureFiles(root)
++	if err != nil {
++		t.Fatal(err)
++	}
++	byPath := make(map[string]sourceScanFile, len(files))
++	for _, item := range files {
++		byPath[item.relative] = item
++	}
++	bootstrapFile, ok := byPath["cmd/gateway/bootstrap_source.go"]
++	if !ok {
++		t.Fatal("bootstrap source production file is missing")
++	}
++	supervisorFile, ok := byPath["cmd/gateway/session_supervisor.go"]
++	if !ok {
++		t.Fatal("session supervisor production file is missing")
++	}
++	ownerFile, ok := byPath["internal/runtime/source/owner_bootstrap.go"]
++	if !ok {
++		t.Fatal("source owner production file is missing")
++	}
++	allowed := map[*ast.Ident]bool{}
++	checkInitialOwner(t, supervisorFile, allowed)
++	checkBootstrapLiteral(t, bootstrapFile, allowed)
++	checkCopyReport(t, bootstrapFile)
++	checkCaptureMethod(t, bootstrapFile)
++
++	markSourceBootstrap(t, ownerFile, allowed)
++	markBootstrapParams(t, ownerFile, allowed)
++	registerCalls := 0
++	seenRegister := map[*ast.SelectorExpr]bool{}
++	for _, item := range files {
++		for _, declaration := range item.file.Decls {
++			function, ok := declaration.(*ast.FuncDecl)
++			if !ok || function.Body == nil {
++				continue
++			}
++			calls := map[*ast.SelectorExpr]*ast.CallExpr{}
++			ast.Inspect(function.Body, func(node ast.Node) bool {
++				call, ok := node.(*ast.CallExpr)
++				if !ok {
++					return true
++				}
++				selector, ok := call.Fun.(*ast.SelectorExpr)
++				if ok && selector.Sel.Name == "RegisterInitialCandidate" {
++					calls[selector] = call
++				}
++				return true
++			})
++			var sites []sourceSite
++			walker := &siteWalk{method: "RegisterInitialCandidate", path: item.path, fn: function, set: item.set, calls: calls, sites: &sites}
++			ast.Walk(walker, function.Body)
++			for _, site := range sites {
++				if site.depth != 0 || site.nested || site.call == nil {
++					t.Fatalf("RegisterInitialCandidate escaped direct call: %s/%s", item.relative, function.Name.Name)
++				}
++				if item.relative != "cmd/gateway/bootstrap_source.go" || function.Name.Name != "promoteSource" || !sourceExpr(site.selector.X, "start.owner") || len(site.call.Args) != 2 || !sourceExpr(site.call.Args[0], "start.lifecycle") || !sourceExpr(site.call.Args[1], "input") {
++					t.Fatalf("RegisterInitialCandidate caller changed: %s/%s", item.relative, function.Name.Name)
++				}
++				if seenRegister[site.selector] {
++					t.Fatal("duplicate RegisterInitialCandidate caller")
++				}
++				seenRegister[site.selector] = true
++				registerCalls++
++			}
++		}
++		ast.Inspect(item.file, func(node ast.Node) bool {
++			selector, ok := node.(*ast.SelectorExpr)
++			if !ok || selector.Sel.Name != "RegisterInitialCandidate" {
++				return true
++			}
++			if !seenRegister[selector] {
++				t.Fatalf("RegisterInitialCandidate method value or alias at %s", item.relative)
++			}
++			return true
++		})
++	}
++	registerDecls := 0
++	for _, item := range files {
++		for _, declaration := range item.file.Decls {
++			function, ok := declaration.(*ast.FuncDecl)
++			if !ok || function.Name == nil || function.Name.Name != "RegisterInitialCandidate" {
++				continue
++			}
++			registerDecls++
++			if item.relative != "internal/runtime/source/owner_bootstrap.go" || !sourcePointer(function, "Owner") {
++				t.Fatalf("RegisterInitialCandidate declaration escaped source Owner")
++			}
++		}
++	}
++	if registerCalls != 1 || registerDecls != 1 {
++		t.Fatalf("RegisterInitialCandidate calls=%d declarations=%d want=1/1", registerCalls, registerDecls)
++	}
++	for _, item := range files {
++		ast.Inspect(item.file, func(node ast.Node) bool {
++			ident, ok := node.(*ast.Ident)
++			if ok && ident.Name == "SourceBootstrap" && !allowed[ident] {
++				t.Fatalf("SourceBootstrap escaped exact owner paths at %s", item.relative)
++			}
++			return true
++		})
++	}
++}
++
++type sourceScanFile struct {
++	path     string
++	relative string
++	file     *ast.File
++	set      *token.FileSet
++}
++
++func scanCaptureFiles(root string) ([]sourceScanFile, error) {
+ 	const (
+ 		fileLimit = 2048
+ 		byteLimit = int64(128 << 20)
+ 	)
+-	files := 0
+-	var bytesRead int64
+ 	set := token.NewFileSet()
+-	allowed := map[*ast.Ident]bool{}
+-	registerDefs, captureDefs, bootstrapDefs := 0, 0, 0
+-	captureUses, bootstrapUses := 0, 0
++	files := []sourceScanFile{}
++	var bytesRead int64
+ 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+ 		if walkErr != nil {
+ 			return walkErr
+@@ -418,15 +542,14 @@ func checkCaptureCallers(t *testing.T, root string) {
+ 		if entry.Type()&os.ModeSymlink != 0 {
+ 			return fmt.Errorf("production source symlink %s", path)
+ 		}
+-		files++
+-		if files > fileLimit {
++		if len(files) >= fileLimit {
+ 			return fmt.Errorf("initial capture caller file budget exceeded")
+ 		}
+ 		info, err := entry.Info()
+ 		if err != nil {
+ 			return err
+ 		}
+-		if !info.Mode().IsRegular() || info.Size() > byteLimit-bytesRead {
++		if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > byteLimit-bytesRead {
+ 			return fmt.Errorf("initial capture caller source budget exceeded")
+ 		}
+ 		input, err := os.Open(path)
+@@ -434,8 +557,7 @@ func checkCaptureCallers(t *testing.T, root string) {
+ 			return err
+ 		}
+ 		remaining := byteLimit - bytesRead
+-		reader := io.LimitReader(input, remaining+1)
+-		source, readErr := io.ReadAll(reader)
++		source, readErr := io.ReadAll(io.LimitReader(input, remaining+1))
+ 		closeErr := input.Close()
+ 		if err := errors.Join(readErr, closeErr); err != nil {
+ 			return err
+@@ -444,100 +566,324 @@ func checkCaptureCallers(t *testing.T, root string) {
+ 			return fmt.Errorf("initial capture caller source budget exceeded")
+ 		}
+ 		bytesRead += int64(len(source))
+-		file, err := parser.ParseFile(set, path, source, 0)
++		parsed, err := parser.ParseFile(set, path, source, 0)
+ 		if err != nil {
+ 			return fmt.Errorf("parse production source %s: %w", path, err)
+ 		}
+-		for _, declaration := range file.Decls {
+-			switch value := declaration.(type) {
+-			case *ast.FuncDecl:
+-				if value.Name == nil {
+-					continue
+-				}
+-				switch value.Name.Name {
+-				case "RegisterInitialCandidate":
+-					registerDefs++
+-					allowed[value.Name] = true
+-					bootstrapUses += allowParamType(value, "input", "SourceBootstrap", allowed)
+-				case "captureInitialCandidate":
+-					captureUses += allowParamType(value, "capture", "InitialCaptureFunc", allowed)
+-				case "validateBootstrap":
+-					bootstrapUses += allowParamType(value, "input", "SourceBootstrap", allowed)
++		relative, err := filepath.Rel(root, path)
++		if err != nil {
++			return err
++		}
++		files = append(files, sourceScanFile{path: path, relative: filepath.ToSlash(relative), file: parsed, set: set})
++		return nil
++	})
++	return files, err
++}
++
++func checkInitialOwner(t *testing.T, item sourceScanFile, allowed map[*ast.Ident]bool) {
++	t.Helper()
++	if item.relative != "cmd/gateway/session_supervisor.go" {
++		t.Fatalf("initialSourceOwner file changed: %s", item.relative)
++	}
++	count := 0
++	for _, declaration := range item.file.Decls {
++		gen, ok := declaration.(*ast.GenDecl)
++		if !ok || gen.Tok != token.TYPE {
++			continue
++		}
++		for _, specification := range gen.Specs {
++			typeSpec, ok := specification.(*ast.TypeSpec)
++			if !ok || typeSpec.Name == nil || typeSpec.Name.Name != "initialSourceOwner" {
++				continue
++			}
++			count++
++			interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
++			if !ok || interfaceType.Methods == nil || len(interfaceType.Methods.List) != 1 {
++				t.Fatal("initialSourceOwner must contain exactly one method")
++			}
++			field := interfaceType.Methods.List[0]
++			if len(field.Names) != 1 || field.Names[0].Name != "RegisterInitialCandidate" {
++				t.Fatal("initialSourceOwner method changed")
++			}
++			method, ok := field.Type.(*ast.FuncType)
++			if !ok || method.Params == nil || len(method.Params.List) != 2 || method.Results == nil || len(method.Results.List) != 2 {
++				t.Fatal("initialSourceOwner signature changed")
++			}
++			if !sourcePathExpr(method.Params.List[0].Type, "context", "Context") || !sourcePathExpr(method.Params.List[1].Type, "sourceowner", "SourceBootstrap") || !sourcePathExpr(method.Results.List[0].Type, "storeiface", "SourceAuthorityCurrentV1") || !sourceIdent(method.Results.List[1].Type, "error") {
++				t.Fatal("initialSourceOwner argument or result changed")
++			}
++			allowed[method.Params.List[1].Type.(*ast.SelectorExpr).Sel] = true
++		}
++	}
++	if count != 1 {
++		t.Fatalf("initialSourceOwner declarations=%d want=1", count)
++	}
++}
++
++func checkBootstrapLiteral(t *testing.T, item sourceScanFile, allowed map[*ast.Ident]bool) {
++	t.Helper()
++	if item.relative != "cmd/gateway/bootstrap_source.go" {
++		t.Fatalf("SourceBootstrap literal file changed: %s", item.relative)
++	}
++	count := 0
++	captureValues := 0
++	ast.Inspect(item.file, func(node ast.Node) bool {
++		selector, ok := node.(*ast.SelectorExpr)
++		if ok && selector.Sel.Name == "capture" {
++			captureValues++
++			if !sourcePathExpr(selector.X, "capture") {
++				t.Fatal("capture method value escaped promoteSource")
++			}
++		}
++		return true
++	})
++	for _, declaration := range item.file.Decls {
++		function, ok := declaration.(*ast.FuncDecl)
++		if !ok || function.Name == nil || function.Name.Name != "promoteSource" || function.Body == nil {
++			continue
++		}
++		ast.Inspect(function.Body, func(node ast.Node) bool {
++			literal, ok := node.(*ast.CompositeLit)
++			if !ok || !sourcePathExpr(literal.Type, "sourceowner", "SourceBootstrap") {
++				return true
++			}
++			count++
++			if len(literal.Elts) != 6 {
++				t.Fatal("SourceBootstrap literal is incomplete")
++			}
++			allowed[literal.Type.(*ast.SelectorExpr).Sel] = true
++			keys := []string{"StoreRef", "WriterRef", "Lease", "Lifecycle", "SourceRoot", "Capture"}
++			values := [][]string{{"pre", "Source", "Ingress", "StoreRef"}, {"current0", "Lease", "OwnerRef"}, {"current0", "Lease"}, {"current0", "LeaseLifecycle"}, {"pre", "Source", "MaterialPath"}, {"capture", "capture"}}
++			for index, element := range literal.Elts {
++				field, ok := element.(*ast.KeyValueExpr)
++				if !ok || !sourceIdent(field.Key, keys[index]) || !sourcePathExpr(field.Value, values[index]...) {
++					t.Fatalf("SourceBootstrap field %d changed", index)
+ 				}
+-			case *ast.GenDecl:
+-				if value.Tok != token.TYPE {
+-					continue
++			}
++			return true
++		})
++	}
++	if count != 1 || captureValues != 1 {
++		t.Fatalf("SourceBootstrap literals=%d capture values=%d want=1/1", count, captureValues)
++	}
++}
++
++func checkCopyReport(t *testing.T, item sourceScanFile) {
++	t.Helper()
++	count := 0
++	for _, declaration := range item.file.Decls {
++		function, ok := declaration.(*ast.FuncDecl)
++		if !ok || function.Name == nil || function.Name.Name != "copyReport" || function.Body == nil {
++			continue
++		}
++		count++
++		if len(function.Body.List) != 3 {
++			t.Fatal("copyReport body changed")
++		}
++		for index, field := range []string{"StateRefs", "SourceRefs"} {
++			assignment, ok := function.Body.List[index].(*ast.AssignStmt)
++			if !ok || assignment.Tok != token.ASSIGN || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 || !sourcePathExpr(assignment.Lhs[0], "report", "Inventory", field) {
++				t.Fatalf("copyReport %s assignment changed", field)
++			}
++			appendCall, ok := assignment.Rhs[0].(*ast.CallExpr)
++			if !ok || len(appendCall.Args) != 2 || !sourceIdent(appendCall.Fun, "append") || !zeroSlice(appendCall.Args[0]) || !sourcePathExpr(appendCall.Args[1], "report", "Inventory", field) {
++				t.Fatalf("copyReport %s copy is not isolated", field)
++			}
++		}
++		result, ok := function.Body.List[2].(*ast.ReturnStmt)
++		if !ok || len(result.Results) != 1 || !sourceIdent(result.Results[0], "report") {
++			t.Fatal("copyReport return changed")
++		}
++	}
++	if count != 1 {
++		t.Fatalf("copyReport declarations=%d want=1", count)
++	}
++}
++
++func checkCaptureMethod(t *testing.T, item sourceScanFile) {
++	t.Helper()
++	count := 0
++	for _, declaration := range item.file.Decls {
++		function, ok := declaration.(*ast.FuncDecl)
++		if !ok || function.Name == nil || function.Name.Name != "capture" || function.Body == nil {
++			continue
++		}
++		count++
++		if !sourceReceiver(function, "initialCapture") {
++			t.Fatal("initialCapture receiver changed")
++		}
++		calls := map[*ast.SelectorExpr]*ast.CallExpr{}
++		var produceLine, equalityLine, buildLine int
++		produceCount, equalityCount, buildCount := 0, 0, 0
++		set := item.set
++		ast.Inspect(function.Body, func(node ast.Node) bool {
++			if _, ok := node.(*ast.FuncLit); ok {
++				t.Fatal("capture closure escaped owner callback")
++			}
++			if _, ok := node.(*ast.GoStmt); ok {
++				t.Fatal("capture goroutine escaped owner callback")
++			}
++			if binary, ok := node.(*ast.BinaryExpr); ok && binary.Op == token.LOR && sourceCaptureEqual(binary) {
++				equalityCount++
++				equalityLine = set.Position(binary.Pos()).Line
++			}
++			call, ok := node.(*ast.CallExpr)
++			if !ok {
++				return true
++			}
++			selector, ok := call.Fun.(*ast.SelectorExpr)
++			if !ok {
++				return true
++			}
++			switch selector.Sel.Name {
++			case "ProduceCapture":
++				calls[selector] = call
++				produceCount++
++				produceLine = set.Position(selector.Pos()).Line
++				if !sourcePathExpr(selector.X, "intentinventory") || len(call.Args) != 2 || !sourcePathExpr(call.Args[0], "ctx") || !sourcePathExpr(call.Args[1], "input", "StagingPath") {
++					t.Fatal("ProduceCapture arguments changed")
+ 				}
+-				for _, specification := range value.Specs {
+-					typeSpec, ok := specification.(*ast.TypeSpec)
+-					if !ok || typeSpec.Name == nil {
+-						continue
+-					}
+-					switch typeSpec.Name.Name {
+-					case "InitialCaptureFunc":
+-						captureDefs++
+-						allowed[typeSpec.Name] = true
+-					case "SourceBootstrap":
+-						bootstrapDefs++
+-						allowed[typeSpec.Name] = true
+-						structType, ok := typeSpec.Type.(*ast.StructType)
+-						if !ok || structType.Fields == nil {
+-							continue
+-						}
+-						for _, field := range structType.Fields.List {
+-							if field == nil || field.Type == nil {
+-								continue
+-							}
+-							for _, name := range field.Names {
+-								if name != nil && name.Name == "Capture" {
+-									if ident, ok := field.Type.(*ast.Ident); ok && ident.Name == "InitialCaptureFunc" {
+-										allowed[ident] = true
+-										captureUses++
+-									}
+-								}
+-							}
+-						}
+-					}
++			case "BuildCapture":
++				calls[selector] = call
++				buildCount++
++				buildLine = set.Position(selector.Pos()).Line
++				if !sourcePathExpr(selector.X, "sourcecapture") || len(call.Args) != 2 || !sourcePathExpr(call.Args[0], "report") || !sourcePathExpr(call.Args[1], "input", "QuiescenceRef") {
++					t.Fatal("BuildCapture arguments changed")
+ 				}
+ 			}
+-		}
+-		ast.Inspect(file, func(node ast.Node) bool {
+-			ident, ok := node.(*ast.Ident)
+-			if !ok || (ident.Name != "RegisterInitialCandidate" && ident.Name != "InitialCaptureFunc" && ident.Name != "SourceBootstrap") {
++			return true
++		})
++		ast.Inspect(function.Body, func(node ast.Node) bool {
++			selector, ok := node.(*ast.SelectorExpr)
++			if !ok || (selector.Sel.Name != "ProduceCapture" && selector.Sel.Name != "BuildCapture") {
+ 				return true
+ 			}
+-			if !allowed[ident] {
+-				t.Fatalf("production caller or escape %s at %s", ident.Name, set.Position(ident.Pos()))
++			if calls[selector] == nil {
++				t.Fatal("capture operation escaped direct call")
+ 			}
+ 			return true
+ 		})
+-		return nil
+-	})
+-	if err != nil {
+-		t.Fatal(err)
++		if produceCount != 1 || equalityCount != 1 || buildCount != 1 || produceLine >= equalityLine || equalityLine >= buildLine {
++			t.Fatalf("capture order produce=%d/%d equality=%d/%d build=%d/%d", produceCount, produceLine, equalityCount, equalityLine, buildCount, buildLine)
++		}
+ 	}
+-	if registerDefs != 1 || captureDefs != 1 || bootstrapDefs != 1 || captureUses != 2 || bootstrapUses != 2 {
+-		t.Fatalf("initial capture shape register=%d callback=%d bootstrap=%d uses=%d/%d want=1/1/1/2/2", registerDefs, captureDefs, bootstrapDefs, captureUses, bootstrapUses)
++	if count != 1 {
++		t.Fatalf("initialCapture methods=%d want=1", count)
+ 	}
+ }
+ 
+-func allowParamType(function *ast.FuncDecl, name, typeName string, allowed map[*ast.Ident]bool) int {
+-	if function == nil || function.Type == nil || function.Type.Params == nil {
+-		return 0
++func markSourceBootstrap(t *testing.T, item sourceScanFile, allowed map[*ast.Ident]bool) {
++	t.Helper()
++	count := 0
++	for _, declaration := range item.file.Decls {
++		gen, ok := declaration.(*ast.GenDecl)
++		if !ok || gen.Tok != token.TYPE {
++			continue
++		}
++		for _, specification := range gen.Specs {
++			typeSpec, ok := specification.(*ast.TypeSpec)
++			if !ok || typeSpec.Name == nil || typeSpec.Name.Name != "SourceBootstrap" {
++				continue
++			}
++			count++
++			allowed[typeSpec.Name] = true
++		}
++	}
++	if count != 1 {
++		t.Fatalf("SourceBootstrap declarations=%d want=1", count)
+ 	}
+-	uses := 0
+-	for _, field := range function.Type.Params.List {
+-		if field == nil || len(field.Names) != 1 || field.Names[0].Name != name {
++}
++
++func markBootstrapParams(t *testing.T, item sourceScanFile, allowed map[*ast.Ident]bool) {
++	t.Helper()
++	counts := map[string]int{"RegisterInitialCandidate": 0, "validateBootstrap": 0}
++	for _, declaration := range item.file.Decls {
++		function, ok := declaration.(*ast.FuncDecl)
++		if !ok || function.Name == nil {
+ 			continue
+ 		}
+-		ident, ok := field.Type.(*ast.Ident)
+-		if !ok || ident.Name != typeName {
++		name := function.Name.Name
++		if _, wanted := counts[name]; !wanted {
+ 			continue
+ 		}
+-		allowed[ident] = true
+-		uses++
++		found := 0
++		if function.Type.Params != nil {
++			for _, field := range function.Type.Params.List {
++				if len(field.Names) != 1 || field.Names[0].Name != "input" || !sourceIdent(field.Type, "SourceBootstrap") {
++					continue
++				}
++				allowed[field.Type.(*ast.Ident)] = true
++				found++
++			}
++		}
++		if found != 1 {
++			t.Fatalf("%s SourceBootstrap parameter count=%d", name, found)
++		}
++		counts[name]++
++	}
++	if counts["RegisterInitialCandidate"] != 1 || counts["validateBootstrap"] != 1 {
++		t.Fatalf("SourceBootstrap parameter owners changed: %+v", counts)
+ 	}
+-	return uses
++}
++
++func sourceIdent(expr ast.Expr, want string) bool {
++	ident, ok := expr.(*ast.Ident)
++	return ok && ident.Name == want
++}
++
++func sourcePathExpr(expr ast.Expr, want ...string) bool {
++	if len(want) == 0 {
++		return false
++	}
++	if len(want) == 1 {
++		return sourceIdent(expr, want[0])
++	}
++	selector, ok := expr.(*ast.SelectorExpr)
++	return ok && selector.Sel.Name == want[len(want)-1] && sourcePathExpr(selector.X, want[:len(want)-1]...)
++}
++
++func zeroSlice(expr ast.Expr) bool {
++	call, ok := expr.(*ast.CallExpr)
++	if !ok || len(call.Args) != 1 || !sourceIdent(call.Args[0], "nil") {
++		return false
++	}
++	array, ok := call.Fun.(*ast.ArrayType)
++	return ok && sourceIdent(array.Elt, "string")
++}
++
++func sourceReceiver(function *ast.FuncDecl, want string) bool {
++	if function == nil || function.Recv == nil || len(function.Recv.List) != 1 {
++		return false
++	}
++	return sourceIdent(function.Recv.List[0].Type, want)
++}
++
++func sourcePointer(function *ast.FuncDecl, want string) bool {
++	if function == nil || function.Recv == nil || len(function.Recv.List) != 1 {
++		return false
++	}
++	pointer, ok := function.Recv.List[0].Type.(*ast.StarExpr)
++	return ok && sourceIdent(pointer.X, want)
++}
++
++func sourceCaptureEqual(binary *ast.BinaryExpr) bool {
++	if binary == nil || binary.Op != token.LOR {
++		return false
++	}
++	left, ok := binary.X.(*ast.BinaryExpr)
++	if !ok || left.Op != token.NEQ || !sourcePathExpr(left.X, "report", "WorldDigest") || !sourcePathExpr(left.Y, "c", "report", "WorldDigest") {
++		return false
++	}
++	right, ok := binary.Y.(*ast.UnaryExpr)
++	if !ok || right.Op != token.NOT {
++		return false
++	}
++	call, ok := right.X.(*ast.CallExpr)
++	if !ok || len(call.Args) != 2 {
++		return false
++	}
++	selector, ok := call.Fun.(*ast.SelectorExpr)
++	return ok && sourcePathExpr(selector.X, "reflect") && selector.Sel.Name == "DeepEqual" && sourcePathExpr(call.Args[0], "report", "Inventory") && sourcePathExpr(call.Args[1], "c", "report", "Inventory")
+ }
+ 
+ func checkSites(t *testing.T, root string) {
+@@ -550,15 +896,44 @@ func checkSites(t *testing.T, root string) {
+ 	if err != nil {
+ 		t.Fatalf("scan material sites: %v", err)
+ 	}
+-	if len(branches) != 2 || len(materials) != 1 {
++	if len(branches) != 4 || len(materials) != 1 {
+ 		t.Fatalf("site counts branch=%d material=%d", len(branches), len(materials))
+ 	}
++	checkSite(t, root, materials[0], "InspectCandidateMaterial", "material", []string{"ctx", "first"})
++	composeSites := make([]sourceSite, 0, 2)
+ 	for _, site := range branches {
++		if site.fn != nil && site.fn.Name != nil && site.fn.Name.Name == "composeSource" {
++			composeSites = append(composeSites, site)
++			continue
++		}
++		checkPromotionSite(t, root, site)
++	}
++	if len(composeSites) != 2 {
++		t.Fatalf("compose branch sites=%d want=2", len(composeSites))
++	}
++	if composeSites[0].line >= materials[0].line || materials[0].line >= composeSites[1].line {
++		t.Fatalf("compose source order changed: branch=%d/%d material=%d", composeSites[0].line, composeSites[1].line, materials[0].line)
++	}
++	for _, site := range composeSites {
+ 		checkSite(t, root, site, "InspectInitialSourceBranch", "initial", []string{"ctx", "lookup"})
+ 	}
+-	checkSite(t, root, materials[0], "InspectCandidateMaterial", "material", []string{"ctx", "first"})
+-	if branches[0].line >= materials[0].line || materials[0].line >= branches[1].line {
+-		t.Fatal("source call order is not inspect-material-inspect")
++}
++
++func checkPromotionSite(t *testing.T, root string, site sourceSite) {
++	t.Helper()
++	if site.value || site.call == nil {
++		t.Fatal("promotion branch inspection escaped direct call")
++	}
++	relative, err := filepath.Rel(root, site.path)
++	if err != nil {
++		t.Fatalf("promotion branch caller: %v", err)
++	}
++	if filepath.ToSlash(relative) != "cmd/gateway/bootstrap_source.go" || site.fn.Name.Name != "promoteSource" {
++		t.Fatalf("promotion branch caller escaped promoteSource")
++	}
++	selector, ok := site.call.Fun.(*ast.SelectorExpr)
++	if !ok || !sourceExpr(selector.X, "start.store") || len(site.call.Args) != 2 || !sourceExpr(site.call.Args[0], "start.lifecycle") || !sourceExpr(site.call.Args[1], "lookup") {
++		t.Fatalf("promotion branch receiver or arguments changed")
+ 	}
+ }
+ 
+@@ -741,6 +1116,7 @@ func checkFile(t *testing.T, file *ast.File) {
+ 	imports := map[string]string{
+ 		"context": "context", "hex": "encoding/hex", "fmt": "fmt", "filepath": "path/filepath",
+ 		"reflect": "reflect", "strings": "strings", "unicode": "unicode", "utf8": "unicode/utf8",
++		"intentinventory": "polaris/internal/application/intentinventory", "sourcecapture": "polaris/internal/application/sourcecapture",
+ 		"config": "polaris/internal/config", "sourceowner": "polaris/internal/runtime/source", "storeiface": "polaris/internal/store",
+ 	}
+ 	for _, item := range file.Imports {
+@@ -761,14 +1137,16 @@ func checkFile(t *testing.T, file *ast.File) {
+ 	members := map[string]map[string]bool{
+ 		"context": {"Context": true}, "hex": {"DecodeString": true}, "fmt": {"Errorf": true},
+ 		"filepath": {"Clean": true, "IsAbs": true, "Join": true},
+-		"reflect":  {"Chan": true, "Func": true, "Interface": true, "Map": true, "Pointer": true, "Slice": true, "UnsafePointer": true, "ValueOf": true},
++		"reflect":  {"Chan": true, "DeepEqual": true, "Func": true, "Interface": true, "Map": true, "Pointer": true, "Slice": true, "UnsafePointer": true, "ValueOf": true},
+ 		"strings":  {"HasPrefix": true, "IndexFunc": true, "ToLower": true, "TrimPrefix": true, "TrimSpace": true},
+ 		"unicode":  {"IsControl": true}, "utf8": {"ValidString": true},
+-		"config":      {"DefaultBootstrapPolicy": true, "GatewayBootstrapConfigV1": true, "ValidateBootstrapConfig": true},
+-		"sourceowner": {"CandidateMaterialV1": true},
+-		"storeiface":  {"InitialSourceBranchCorruptV1": true, "InitialSourceBranchFirstBootV1": true, "InitialSourceBranchRestartDurableV1": true, "InitialSourceBranchResultV1": true, "SourceAuthorityCurrentV1": true, "SourceAuthorityLookupV1": true},
++		"config":          {"DefaultBootstrapPolicy": true, "GatewayBootstrapConfigV1": true, "ValidateBootstrapConfig": true},
++		"intentinventory": {"CaptureReportV1": true, "ProduceCapture": true},
++		"sourcecapture":   {"BuildCapture": true},
++		"sourceowner":     {"CandidateMaterialV1": true, "InitialCaptureInput": true, "SourceBootstrap": true, "SourceCaptureV1": true},
++		"storeiface":      {"InitialSourceBranchCorruptV1": true, "InitialSourceBranchFirstBootV1": true, "InitialSourceBranchRestartDurableV1": true, "InitialSourceBranchResultV1": true, "RuntimeSessionSnapshotV1": true, "SourceAuthorityCurrentV1": true, "SourceAuthorityLookupV1": true},
+ 	}
+-	helpers := map[string]bool{"bootstrapIngressDigest": true, "len": true, "nilPort": true, "normalized": true, "strictCurrent": true, "strictDigest": true, "validateIngress": true}
++	helpers := map[string]bool{"append": true, "bootstrapIngressDigest": true, "copyReport": true, "len": true, "nilPort": true, "normalized": true, "strictCurrent": true, "strictDigest": true, "validateIngress": true}
+ 	forbidden := ""
+ 	ast.Inspect(file, func(node ast.Node) bool {
+ 		if node == nil {
+@@ -790,6 +1168,9 @@ func checkFile(t *testing.T, file *ast.File) {
+ 			return true
+ 		}
+ 		fun := callFun(call.Fun)
++		if _, conversion := fun.(*ast.ArrayType); conversion {
++			return true
++		}
+ 		ident, identOK := fun.(*ast.Ident)
+ 		callSelector, callSelectorOK := fun.(*ast.SelectorExpr)
+ 		if !identOK && !callSelectorOK {
+@@ -801,9 +1182,12 @@ func checkFile(t *testing.T, file *ast.File) {
+ 		if callSelectorOK {
+ 			packageName, packageOK := callSelector.X.(*ast.Ident)
+ 			if !packageOK {
+-				forbidden = "non-ident receiver"
++				allowed := (sourceExpr(callSelector.X, "start.owner") && callSelector.Sel.Name == "RegisterInitialCandidate") || (sourceExpr(callSelector.X, "start.store") && callSelector.Sel.Name == "InspectInitialSourceBranch")
++				if !allowed {
++					forbidden = "non-ident receiver"
++				}
+ 			} else if _, imported := members[packageName.Name]; !imported {
+-				allowed := (packageName.Name == "initial" && callSelector.Sel.Name == "InspectInitialSourceBranch") || (packageName.Name == "material" && callSelector.Sel.Name == "InspectCandidateMaterial") || (packageName.Name == "value" && (callSelector.Sel.Name == "Kind" || callSelector.Sel.Name == "IsNil"))
++				allowed := (packageName.Name == "ctx" && callSelector.Sel.Name == "Err") || (packageName.Name == "initial" && callSelector.Sel.Name == "InspectInitialSourceBranch") || (packageName.Name == "material" && callSelector.Sel.Name == "InspectCandidateMaterial") || (packageName.Name == "value" && (callSelector.Sel.Name == "Kind" || callSelector.Sel.Name == "IsNil"))
+ 				if !allowed {
+ 					forbidden = packageName.Name + "." + callSelector.Sel.Name
+ 				}
+diff --git a/cmd/gateway/runtime_mount.go b/cmd/gateway/runtime_mount.go
+index b2c6ab6..bd917b1 100644
+--- a/cmd/gateway/runtime_mount.go
++++ b/cmd/gateway/runtime_mount.go
+@@ -125,6 +125,11 @@ func mountGateway(cfg config.GatewayConfig, manifest config.RuntimeManifestV1) (
+ 		cause := fmt.Errorf("admitted gateway store lacks bootstrap contract")
+ 		return nil, mountedFailure(stop, db, cause)
+ 	}
++	runtimeStore, ok := db.(runtimeSessionStore)
++	if !ok {
++		cause := fmt.Errorf("admitted gateway store lacks runtime session contract")
++		return nil, mountedFailure(stop, db, cause)
++	}
+ 	sqliteStore, ok := db.(*storesqlite.Store)
+ 	if !ok {
+ 		cause := fmt.Errorf("admitted gateway store lacks lease authority")
+@@ -150,7 +155,7 @@ func mountGateway(cfg config.GatewayConfig, manifest config.RuntimeManifestV1) (
+ 	if err != nil {
+ 		return nil, mountedFailure(stop, db, fmt.Errorf("gateway process registration: %w", err))
+ 	}
+-	wait, err := startSessionSupervisor(lifecycle, business, process, manifest, shutdownTimeout)
++	wait, err := startSessionSupervisor(lifecycle, runtimeStore, process, material, manifest, shutdownTimeout)
+ 	if err != nil {
+ 		return nil, mountedFailure(stop, db, fmt.Errorf("gateway session supervisor: %w", err))
+ 	}
+diff --git a/cmd/gateway/runtime_mount_test.go b/cmd/gateway/runtime_mount_test.go
+index df13531..bc4616b 100644
+--- a/cmd/gateway/runtime_mount_test.go
++++ b/cmd/gateway/runtime_mount_test.go
+@@ -1,16 +1,17 @@
+ package main
+ 
+ // ProofReceipt:
+-// new_dimension: one Gateway mount owns ready-path terminal convergence
+-// residency: resident light plus opt-in faithful heavy cold reopen; default heavy path is disabled
++// new_dimension: one Gateway mount owns FirstBoot Source promotion and ready-path terminal convergence
++// residency: resident light plus opt-in faithful heavy cold first/restart; default heavy path is disabled
+ // class: Ψ_light by default; Ψ_heavy only with POLARIS_GATEWAY_REAL_MOUNT_COLD=1 on darwin/arm64
+ // budget.light: wall<=20s,RSS<=512MiB,temp_write<=128MiB,network=0,subprocess=0,concurrency=1
+-// budget.heavy: wall<=120s,RSS<=1GiB,temp_write<=1GiB,network=0,subprocess=0,concurrency=1
++// budget.heavy: wall<=180s,RSS<=1GiB,IO<=2GiB,network=0,subprocess<=6,concurrency=1
+ // identity: TestGatewayMountResidentWitness/TestGatewayMountTerminalMatrix/TestGatewayMountJoin/TestGatewayHTTPAdapter/TestGatewayRealMountCold
+-// owner: Gateway real runtime mount
+-// collapse: retain this combined resident light plus opt-in heavy witness; discard scratch state
++// owner: Gateway mount with Source promotion before the sole supervisor
++// collapse: retain this combined resident light plus opt-in heavy first/restart witness; discard scratch state
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/tls"
+ 	"database/sql"
+@@ -19,6 +20,8 @@ import (
+ 	"go/ast"
+ 	"go/parser"
+ 	"go/token"
++	"io"
++	"io/fs"
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
+@@ -534,7 +537,7 @@ func TestGatewayMountResidentWitness(t *testing.T) {
+ 	checkCallArgs(t, mountFunction, "buildBootstrapIngress", []string{"admitted.binding", "manifest", "bootstrap"})
+ 	checkCallArgs(t, mountFunction, "NewOwner", []string{"business", "bootstrap.SourceCandidateRoot"})
+ 	checkCallArgs(t, mountFunction, "registerBootstrapProcess", []string{"lifecycle", "business", "initial", "material", "ingress", "manifest", "identity"})
+-	checkCallArgs(t, mountFunction, "startSessionSupervisor", []string{"lifecycle", "business", "process", "manifest", "shutdownTimeout"})
++	checkCallArgs(t, mountFunction, "startSessionSupervisor", []string{"lifecycle", "runtimeStore", "process", "material", "manifest", "shutdownTimeout"})
+ 
+ 	joinFunction := functions["joinSession"]
+ 	if joinFunction == nil {
+@@ -1113,7 +1116,7 @@ func TestGatewayRealMountCold(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	t.Cleanup(func() {
+-		if err := os.RemoveAll(root); err != nil {
++		if err := cleanColdRoot(root); err != nil {
+ 			t.Errorf("remove faithful mount root: %v", err)
+ 		}
+ 	})
+@@ -1122,9 +1125,9 @@ func TestGatewayRealMountCold(t *testing.T) {
+ 	if err := os.Mkdir(candidateRoot, 0o700); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	initialRoot := "/Volumes/移动硬盘/polars"
+-	if info, err := os.Stat(initialRoot); err != nil || !info.IsDir() {
+-		t.Fatalf("initial source root=%s err=%v", initialRoot, err)
++	initialRoot := filepath.Join(root, "initial-source")
++	if err := copySourceView(t, "/Volumes/移动硬盘/polars", initialRoot); err != nil {
++		t.Fatalf("copy initial source view: %v", err)
+ 	}
+ 	t.Setenv("POLARIS_BOOTSTRAP_STORE_REF", "store-gateway-real-mount")
+ 	t.Setenv("POLARIS_INITIAL_SOURCE_ROOT", initialRoot)
+@@ -1144,44 +1147,73 @@ func TestGatewayRealMountCold(t *testing.T) {
+ 		SourceCandidateRoot: candidateRoot,
+ 		ShutdownTimeout:     time.Second,
+ 	}
+-	mount, err := mountGateway(cfg, manifest)
++	first := runColdMount(t, cfg, manifest)
++	if !first.storeClosed {
++		t.Fatal("first faithful mount store was not closed")
++	}
++	verify := reopenMountStore(t, dbPath)
++	lookup := storeiface.SourceAuthorityLookupV1{StoreRef: "store-gateway-real-mount"}
++	branch, err := verify.InspectInitialSourceBranch(context.Background(), lookup)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	server := &mountServerFake{started: make(chan struct{}), release: make(chan struct{}), block: true}
+-	go func() {
+-		<-server.started
+-		mount.stop()
+-	}()
+-	if err := mount.run(server); err != nil {
+-		t.Fatalf("run faithful mount: %v", err)
++	if branch.Kind != storeiface.InitialSourceBranchRestartDurableV1 || branch.Current.AuthorityRevision != 1 {
++		t.Fatalf("first source branch=%+v", branch)
+ 	}
+-	if mount.storeClosed != true {
+-		t.Fatal("faithful mount store was not closed")
++	firstCurrent := branch.Current
++	if err := verify.Close(); err != nil {
++		t.Fatal(err)
+ 	}
+-	verify := reopenMountStore(t, dbPath)
+-	branch, err := verify.InspectInitialSourceBranch(context.Background(), storeiface.SourceAuthorityLookupV1{StoreRef: "store-gateway-real-mount"})
++	retainedRoot := filepath.Join(root, "retained-source")
++	if err := os.Rename(initialRoot, retainedRoot); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Lstat(initialRoot); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("initial source root still exists after rename: %v", err)
++	}
++	verifyDB, err := sql.Open("sqlite", dbPath)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if branch.Kind != storeiface.InitialSourceBranchFirstBootV1 || branch.Current != (storeiface.SourceAuthorityCurrentV1{}) {
+-		t.Fatalf("source branch=%+v", branch)
++	checkHistory(t, verifyDB, 3, 1, 3, 3)
++	checkCurrent(t, verifyDB)
++	checkM1(t, verifyDB, "store-gateway-real-mount")
++	checkSource(t, verifyDB, "store-gateway-real-mount", 1, 0)
++	if err := verifyDB.Close(); err != nil {
++		t.Fatal(err)
+ 	}
+-	if err := verify.Close(); err != nil {
++	second := runColdMount(t, cfg, manifest)
++	if !second.storeClosed {
++		t.Fatal("second faithful mount store was not closed")
++	}
++	verifyAgain := reopenMountStore(t, dbPath)
++	branchAgain, err := verifyAgain.InspectInitialSourceBranch(context.Background(), lookup)
++	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	verifyDB, err := sql.Open("sqlite", dbPath)
++	if branchAgain.Kind != storeiface.InitialSourceBranchRestartDurableV1 || branchAgain.Current != firstCurrent {
++		t.Fatalf("restart source branch=%+v want=%+v", branchAgain, firstCurrent)
++	}
++	if err := verifyAgain.Close(); err != nil {
++		t.Fatal(err)
++	}
++	candidatePath := filepath.Join(candidateRoot, "candidates", strings.TrimPrefix(firstCurrent.CandidateRef, "sha256:"))
++	if err := verifyViewTree(retainedRoot, candidatePath, 0, true, &sourceViewBudget{}); err != nil {
++		t.Fatalf("retained source and candidate differ: %v", err)
++	}
++	finalDB, err := sql.Open("sqlite", dbPath)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	t.Cleanup(func() {
+-		if err := verifyDB.Close(); err != nil {
+-			t.Errorf("close faithful verification database: %v", err)
++		if err := finalDB.Close(); err != nil {
++			t.Errorf("close faithful final database: %v", err)
+ 		}
+ 	})
+-	checkHistory(t, verifyDB, 2, 1, 2, 2)
+-	checkCurrent(t, verifyDB)
+-	checkM1(t, verifyDB, "store-gateway-real-mount")
++	checkHistory(t, finalDB, 7, 2, 6, 7)
++	checkCurrent(t, finalDB)
++	checkM1(t, finalDB, "store-gateway-real-mount")
++	checkSource(t, finalDB, "store-gateway-real-mount", 1, 0)
+ 	registry, result, err := storesqlite.OpenStoreRegistry(context.Background(), storeiface.StoreRegistryLookupV1{CanonicalDBPath: dbPath})
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -1194,9 +1226,26 @@ func TestGatewayRealMountCold(t *testing.T) {
+ 			t.Errorf("close faithful registry: %v", err)
+ 		}
+ 	})
+-	if result.Kind != storeiface.StoreRegistryBindingBound || result.Binding != mount.binding {
+-		t.Fatalf("cold binding result=%+v mount=%+v", result, mount.binding)
++	if result.Kind != storeiface.StoreRegistryBindingBound || result.Binding != second.binding {
++		t.Fatalf("cold binding result=%+v mount=%+v", result, second.binding)
++	}
++}
++
++func runColdMount(t *testing.T, cfg config.GatewayConfig, manifest config.RuntimeManifestV1) *gatewayMount {
++	t.Helper()
++	mount, err := mountGateway(cfg, manifest)
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := &mountServerFake{started: make(chan struct{}), release: make(chan struct{}), block: true}
++	go func() {
++		<-server.started
++		mount.stop()
++	}()
++	if err := mount.run(server); err != nil {
++		t.Fatalf("run faithful mount: %v", err)
+ 	}
++	return mount
+ }
+ 
+ func reopenMountStore(t *testing.T, path string) *storesqlite.Store {
+@@ -1239,13 +1288,13 @@ func checkCurrent(t *testing.T, store *sql.DB) {
+ 	queries := map[string]string{
+ 		"intent_writer_lease_current": "SELECT count(*) FROM intent_writer_lease_current WHERE store_ref = ? COLLATE BINARY AND issued_at = expires_at",
+ 		"intent_process_current":      "SELECT count(*) FROM intent_process_current WHERE store_ref = ? COLLATE BINARY AND expires_at = (SELECT expires_at FROM intent_writer_lease_current WHERE store_ref = ? COLLATE BINARY)",
+-		"intent_heartbeat_current":    "SELECT count(*) FROM intent_heartbeat_current WHERE store_ref = ? COLLATE BINARY AND observed_at = expires_at",
++		"intent_heartbeat_current":    "SELECT count(*) FROM intent_heartbeat_current WHERE store_ref = ? COLLATE BINARY AND observed_at = expires_at AND (process_lease_id, heartbeat_ref) = (SELECT runtime.process_lease_id, runtime.heartbeat_ref FROM runtime_epoch_current AS runtime WHERE runtime.store_ref = ? COLLATE BINARY AND runtime.observed_at = runtime.expires_at)",
+ 		"runtime_epoch_current":       "SELECT count(*) FROM runtime_epoch_current WHERE store_ref = ? COLLATE BINARY AND observed_at = expires_at",
+ 	}
+ 	for table, query := range queries {
+ 		var got int
+ 		args := []any{"store-gateway-real-mount"}
+-		if table == "intent_process_current" {
++		if table == "intent_process_current" || table == "intent_heartbeat_current" {
+ 			args = append(args, "store-gateway-real-mount")
+ 		}
+ 		if err := store.QueryRow(query, args...).Scan(&got); err != nil {
+@@ -1270,3 +1319,332 @@ func checkM1(t *testing.T, store *sql.DB, storeRef string) {
+ 		}
+ 	}
+ }
++
++func checkSource(t *testing.T, store *sql.DB, storeRef string, revision, history int) {
++	t.Helper()
++	var current, archived int
++	if err := store.QueryRow("SELECT count(*) FROM source_authority_current WHERE store_ref = ? COLLATE BINARY", storeRef).Scan(&current); err != nil {
++		t.Fatalf("count source current: %v", err)
++	}
++	if err := store.QueryRow("SELECT count(*) FROM source_authority_history WHERE store_ref = ? COLLATE BINARY", storeRef).Scan(&archived); err != nil {
++		t.Fatalf("count source history: %v", err)
++	}
++	if current != 1 || archived != history {
++		t.Fatalf("source rows current=%d history=%d want current=1 history=%d", current, archived, history)
++	}
++	var got int
++	if err := store.QueryRow("SELECT authority_revision FROM source_authority_current WHERE store_ref = ? COLLATE BINARY", storeRef).Scan(&got); err != nil {
++		t.Fatalf("read source revision: %v", err)
++	}
++	if got != revision {
++		t.Fatalf("source revision=%d want=%d", got, revision)
++	}
++}
++
++const (
++	viewMaxFiles = 20000
++	viewMaxDirs  = 20000
++	viewMaxDepth = 64
++	viewMaxBytes = int64(128 << 20)
++	viewMaxFile  = int64(8 << 20)
++)
++
++type sourceViewBudget struct {
++	files int
++	dirs  int
++	bytes int64
++}
++
++func copySourceView(t *testing.T, sourceRoot, viewRoot string) error {
++	t.Helper()
++	if sourceRoot == "" || !filepath.IsAbs(sourceRoot) || filepath.Clean(sourceRoot) != sourceRoot {
++		return fmt.Errorf("source view root is not absolute and clean")
++	}
++	if viewRoot == "" || !filepath.IsAbs(viewRoot) || filepath.Clean(viewRoot) != viewRoot {
++		return fmt.Errorf("source view destination is not absolute and clean")
++	}
++	sourceInfo, err := os.Lstat(sourceRoot)
++	if err != nil {
++		return err
++	}
++	if sourceInfo.Mode()&os.ModeSymlink != 0 || !sourceInfo.IsDir() {
++		return fmt.Errorf("source view root is not a directory")
++	}
++	if _, err := os.Lstat(viewRoot); err == nil {
++		return fmt.Errorf("source view destination already exists")
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	if err := os.Mkdir(viewRoot, 0o700); err != nil {
++		return err
++	}
++	copyBudget := sourceViewBudget{}
++	if err := copyViewTree(sourceRoot, viewRoot, 0, true, &copyBudget); err != nil {
++		return err
++	}
++	verifyBudget := sourceViewBudget{}
++	return verifyViewTree(sourceRoot, viewRoot, 0, true, &verifyBudget)
++}
++
++func copyViewTree(source, target string, depth int, root bool, budget *sourceViewBudget) error {
++	if budget == nil {
++		return fmt.Errorf("source view budget is nil")
++	}
++	if depth > viewMaxDepth {
++		return fmt.Errorf("source view depth budget exceeded")
++	}
++	if budget.dirs >= viewMaxDirs {
++		return fmt.Errorf("source view directory budget exceeded")
++	}
++	budget.dirs++
++	entries, err := os.ReadDir(source)
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		name := entry.Name()
++		sourcePath := filepath.Join(source, name)
++		info, err := os.Lstat(sourcePath)
++		if err != nil {
++			return err
++		}
++		if skipView(name, info, root) {
++			continue
++		}
++		targetPath := filepath.Join(target, name)
++		if info.Mode()&os.ModeSymlink != 0 {
++			return fmt.Errorf("source view symlink is not allowed: %s", sourcePath)
++		}
++		if info.IsDir() {
++			if err := os.Mkdir(targetPath, 0o700); err != nil {
++				return err
++			}
++			if err := copyViewTree(sourcePath, targetPath, depth+1, false, budget); err != nil {
++				return err
++			}
++			continue
++		}
++		if !info.Mode().IsRegular() {
++			return fmt.Errorf("source view special entry is not allowed: %s", sourcePath)
++		}
++		if err := addViewFile(info.Size(), budget); err != nil {
++			return fmt.Errorf("%s: %w", sourcePath, err)
++		}
++		if err := copyViewFile(sourcePath, targetPath, info.Size()); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func verifyViewTree(source, target string, depth int, root bool, budget *sourceViewBudget) error {
++	if budget == nil {
++		return fmt.Errorf("source view budget is nil")
++	}
++	if depth > viewMaxDepth {
++		return fmt.Errorf("source view depth budget exceeded")
++	}
++	if budget.dirs >= viewMaxDirs {
++		return fmt.Errorf("source view directory budget exceeded")
++	}
++	budget.dirs++
++	sourceEntries, err := os.ReadDir(source)
++	if err != nil {
++		return err
++	}
++	targetEntries, err := os.ReadDir(target)
++	if err != nil {
++		return err
++	}
++	remaining := make(map[string]struct{}, len(targetEntries))
++	for _, entry := range targetEntries {
++		remaining[entry.Name()] = struct{}{}
++	}
++	for _, entry := range sourceEntries {
++		name := entry.Name()
++		sourcePath := filepath.Join(source, name)
++		info, err := os.Lstat(sourcePath)
++		if err != nil {
++			return err
++		}
++		if skipView(name, info, root) {
++			if _, found := remaining[name]; found {
++				return fmt.Errorf("excluded source view entry was copied: %s", name)
++			}
++			continue
++		}
++		if _, found := remaining[name]; !found {
++			return fmt.Errorf("source view path missing: %s", sourcePath)
++		}
++		delete(remaining, name)
++		targetPath := filepath.Join(target, name)
++		targetInfo, err := os.Lstat(targetPath)
++		if err != nil {
++			return err
++		}
++		if info.Mode()&os.ModeSymlink != 0 || targetInfo.Mode()&os.ModeSymlink != 0 {
++			return fmt.Errorf("source view symlink is not allowed: %s", sourcePath)
++		}
++		if info.IsDir() {
++			if !targetInfo.IsDir() {
++				return fmt.Errorf("source view kind differs: %s", sourcePath)
++			}
++			if err := verifyViewTree(sourcePath, targetPath, depth+1, false, budget); err != nil {
++				return err
++			}
++			continue
++		}
++		if !info.Mode().IsRegular() || !targetInfo.Mode().IsRegular() {
++			return fmt.Errorf("source view special entry is not allowed: %s", sourcePath)
++		}
++		if err := addViewFile(info.Size(), budget); err != nil {
++			return fmt.Errorf("%s: %w", sourcePath, err)
++		}
++		if targetInfo.Size() != info.Size() {
++			return fmt.Errorf("source view byte length differs: %s", sourcePath)
++		}
++		if err := compareViewFiles(sourcePath, targetPath, info.Size()); err != nil {
++			return err
++		}
++	}
++	if len(remaining) != 0 {
++		for name := range remaining {
++			return fmt.Errorf("source view has extra path: %s", filepath.Join(target, name))
++		}
++	}
++	return nil
++}
++
++func skipView(name string, info os.FileInfo, root bool) bool {
++	if info == nil || !info.IsDir() {
++		return false
++	}
++	return name == ".git" || root && name == "bin"
++}
++
++func addViewFile(size int64, budget *sourceViewBudget) error {
++	if size < 0 || size > viewMaxFile || budget.files >= viewMaxFiles || budget.bytes > viewMaxBytes-size {
++		return fmt.Errorf("source view file budget exceeded")
++	}
++	budget.files++
++	budget.bytes += size
++	return nil
++}
++
++func copyViewFile(source, target string, want int64) error {
++	input, err := os.Open(source)
++	if err != nil {
++		return err
++	}
++	output, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
++	if err != nil {
++		return errors.Join(err, input.Close())
++	}
++	written, copyErr := io.Copy(output, io.LimitReader(input, viewMaxFile+1))
++	closeOut := output.Close()
++	closeIn := input.Close()
++	if err := errors.Join(copyErr, closeOut, closeIn); err != nil {
++		return err
++	}
++	if written > viewMaxFile || written != want {
++		return fmt.Errorf("source view file changed while copying: %s", source)
++	}
++	return nil
++}
++
++func compareViewFiles(source, target string, want int64) error {
++	left, err := os.Open(source)
++	if err != nil {
++		return err
++	}
++	right, err := os.Open(target)
++	if err != nil {
++		return errors.Join(err, left.Close())
++	}
++	leftReader := io.LimitReader(left, viewMaxFile+1)
++	rightReader := io.LimitReader(right, viewMaxFile+1)
++	leftBuffer := make([]byte, 32*1024)
++	rightBuffer := make([]byte, 32*1024)
++	var compared int64
++	var compareErr error
++	for compareErr == nil {
++		leftN, leftErr := leftReader.Read(leftBuffer)
++		rightN, rightErr := rightReader.Read(rightBuffer)
++		if leftN != rightN || !bytes.Equal(leftBuffer[:leftN], rightBuffer[:rightN]) {
++			compareErr = fmt.Errorf("source view file bytes differ: %s", source)
++			break
++		}
++		compared += int64(leftN)
++		if compared > viewMaxFile {
++			compareErr = fmt.Errorf("source view file budget exceeded: %s", source)
++			break
++		}
++		leftEOF := errors.Is(leftErr, io.EOF)
++		rightEOF := errors.Is(rightErr, io.EOF)
++		if leftEOF || rightEOF {
++			if !leftEOF || !rightEOF {
++				compareErr = fmt.Errorf("source view file length differs: %s", source)
++			}
++			break
++		}
++		if leftErr != nil || rightErr != nil {
++			compareErr = errors.Join(leftErr, rightErr)
++			break
++		}
++	}
++	if compareErr == nil && compared != want {
++		compareErr = fmt.Errorf("source view file length differs: %s", source)
++	}
++	closeLeft := left.Close()
++	closeRight := right.Close()
++	return errors.Join(compareErr, closeLeft, closeRight)
++}
++
++const cleanupMaxDirs = 100000
++
++func cleanColdRoot(root string) error {
++	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
++		return fmt.Errorf("cold root is not absolute and clean")
++	}
++	var failures []error
++	dirs := 0
++	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
++		if err != nil {
++			addFailure(&failures, fmt.Errorf("walk cold root %s: %w", path, err))
++			return nil
++		}
++		if entry == nil {
++			addFailure(&failures, fmt.Errorf("walk cold root %s: missing entry", path))
++			return nil
++		}
++		if entry.Type()&os.ModeSymlink != 0 {
++			addFailure(&failures, fmt.Errorf("cold root symlink is not allowed: %s", path))
++			return nil
++		}
++		if entry.IsDir() {
++			dirs++
++			if dirs > cleanupMaxDirs {
++				addFailure(&failures, fmt.Errorf("cold root directory budget exceeded: %s", path))
++				return filepath.SkipDir
++			}
++			if err := os.Chmod(path, 0o700); err != nil {
++				addFailure(&failures, fmt.Errorf("chmod cold root directory %s: %w", path, err))
++			}
++			return nil
++		}
++		if !entry.Type().IsRegular() {
++			addFailure(&failures, fmt.Errorf("cold root special entry is not allowed: %s", path))
++		}
++		return nil
++	})
++	addFailure(&failures, walkErr)
++	removeErr := os.RemoveAll(root)
++	return errors.Join(append(failures, removeErr)...)
++}
++
++func addFailure(failures *[]error, err error) {
++	if failures == nil || err == nil {
++		return
++	}
++	*failures = append(*failures, err)
++}
+diff --git a/cmd/gateway/session_supervisor.go b/cmd/gateway/session_supervisor.go
+index 9927650..a9f24c4 100644
+--- a/cmd/gateway/session_supervisor.go
++++ b/cmd/gateway/session_supervisor.go
+@@ -2,16 +2,19 @@ package main
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"time"
+ 
+ 	"polaris/internal/config"
++	sourceowner "polaris/internal/runtime/source"
+ 	runtime "polaris/internal/runtime_truth"
+ 	storeiface "polaris/internal/store"
+ 	intentv1 "polaris/pkg/contracts/intent/v1"
+ )
+ 
+ type runtimeSessionStore interface {
++	initialInspector
+ 	PublishRuntimeEpoch(
+ 		context.Context,
+ 		runtime.RuntimePublishRequest,
+@@ -26,16 +29,31 @@ type runtimeSessionStore interface {
+ 	) (storeiface.RuntimeSessionResult, error)
+ }
+ 
++type initialSourceOwner interface {
++	RegisterInitialCandidate(context.Context, sourceowner.SourceBootstrap) (storeiface.SourceAuthorityCurrentV1, error)
++}
++
+ type sessionStart struct {
+ 	lifecycle       context.Context
+ 	store           runtimeSessionStore
+ 	process         bootstrapProcess
++	owner           initialSourceOwner
+ 	manifest        runtime.RuntimeManifestFactsV1
+ 	ttlSeconds      uint64
+ 	interval        time.Duration
+ 	shutdownTimeout time.Duration
+ }
+ 
++func (start sessionStart) loop() sessionLoop {
++	return sessionLoop{
++		lifecycle:       start.lifecycle,
++		store:           start.store,
++		manifest:        start.manifest,
++		ttlSeconds:      start.ttlSeconds,
++		shutdownTimeout: start.shutdownTimeout,
++	}
++}
++
+ type sessionLoop struct {
+ 	lifecycle       context.Context
+ 	store           runtimeSessionStore
+@@ -61,20 +79,46 @@ func startSessionSupervisor(
+ 	ctx context.Context,
+ 	store runtimeSessionStore,
+ 	process bootstrapProcess,
++	owner initialSourceOwner,
+ 	manifest config.RuntimeManifestV1,
+ 	shutdownTimeout time.Duration,
+ ) (*sessionWait, error) {
+-	start, err := prepareSession(ctx, store, process, manifest, shutdownTimeout)
++	start, err := prepareSession(ctx, store, process, owner, manifest, shutdownTimeout)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return launchSession(start, nil)
++	current0, err := initializeSession(start)
++	if err != nil {
++		return nil, err
++	}
++	if err := promoteSource(start, current0); err != nil {
++		return nil, abortSession(start, current0, err)
++	}
++	renewed, err := renewSession(start.lifecycle, start.store, current0, start.ttlSeconds)
++	if err != nil {
++		return nil, abortSession(start, current0, err)
++	}
++	if renewed.Kind != storeiface.RuntimeSessionRenewed {
++		cause := fmt.Errorf("gateway session final renew verdict is invalid: %s", renewed.Kind)
++		return nil, abortSession(start, current0, cause)
++	}
++	current1 := renewed.Current
++	loop := start.loop()
++	if err := validateSessionCurrent(loop, current0, current1); err != nil {
++		return nil, abortSession(start, current0, err)
++	}
++	wait, err := launchSession(start, current1, nil)
++	if err != nil {
++		return nil, abortSession(start, current1, err)
++	}
++	return wait, nil
+ }
+ 
+ func prepareSession(
+ 	ctx context.Context,
+ 	store runtimeSessionStore,
+ 	process bootstrapProcess,
++	owner initialSourceOwner,
+ 	manifest config.RuntimeManifestV1,
+ 	shutdownTimeout time.Duration,
+ ) (sessionStart, error) {
+@@ -88,6 +132,9 @@ func prepareSession(
+ 	if nilPort(store) {
+ 		return zero, fmt.Errorf("gateway session store is nil")
+ 	}
++	if nilPort(owner) {
++		return zero, fmt.Errorf("gateway initial source owner is nil")
++	}
+ 
+ 	policy := config.DefaultBootstrapPolicy()
+ 	if err := config.ValidateBootstrapPolicy(policy); err != nil {
+@@ -125,6 +172,7 @@ func prepareSession(
+ 		lifecycle:       ctx,
+ 		store:           store,
+ 		process:         process,
++		owner:           owner,
+ 		manifest:        manifestFacts,
+ 		ttlSeconds:      ingress.AuthorityTTLSeconds,
+ 		interval:        interval,
+@@ -219,14 +267,7 @@ func buildSessionRequest(start sessionStart) (runtime.RuntimePublishRequest, err
+ 	return request, nil
+ }
+ 
+-func launchSession(start sessionStart, ticker sessionTicker) (*sessionWait, error) {
+-	current, err := initializeSession(start)
+-	if err != nil {
+-		if !nilPort(ticker) {
+-			ticker.stop()
+-		}
+-		return nil, err
+-	}
++func launchSession(start sessionStart, current storeiface.RuntimeSessionSnapshotV1, ticker sessionTicker) (*sessionWait, error) {
+ 	if nilPort(ticker) {
+ 		ticker = &systemTicker{ticker: time.NewTicker(start.interval)}
+ 	}
+@@ -236,13 +277,7 @@ func launchSession(start sessionStart, ticker sessionTicker) (*sessionWait, erro
+ 		}
+ 		return nil, fmt.Errorf("gateway session ticker is unavailable")
+ 	}
+-	loop := sessionLoop{
+-		lifecycle:       start.lifecycle,
+-		store:           start.store,
+-		manifest:        start.manifest,
+-		ttlSeconds:      start.ttlSeconds,
+-		shutdownTimeout: start.shutdownTimeout,
+-	}
++	loop := start.loop()
+ 	done := make(chan error, 1)
+ 	go superviseSession(loop, current, ticker, done)
+ 	return &sessionWait{done: done}, nil
+@@ -307,13 +342,7 @@ func initializeSession(start sessionStart) (storeiface.RuntimeSessionSnapshotV1,
+ 	if renewed.Kind != storeiface.RuntimeSessionRenewed {
+ 		return zero, fmt.Errorf("gateway session initial renew verdict is invalid: %s", renewed.Kind)
+ 	}
+-	loop := sessionLoop{
+-		lifecycle:       start.lifecycle,
+-		store:           start.store,
+-		manifest:        start.manifest,
+-		ttlSeconds:      start.ttlSeconds,
+-		shutdownTimeout: start.shutdownTimeout,
+-	}
++	loop := start.loop()
+ 	if err := validateSessionCurrent(loop, snapshot, renewed.Current); err != nil {
+ 		return zero, err
+ 	}
+@@ -631,6 +660,11 @@ func closeCurrent(start sessionLoop, current storeiface.RuntimeSessionSnapshotV1
+ 	return validateSessionCurrent(start, current, closed.Current)
+ }
+ 
++func abortSession(start sessionStart, current storeiface.RuntimeSessionSnapshotV1, cause error) error {
++	closed := closeCurrent(start.loop(), current)
++	return errors.Join(cause, closed)
++}
++
+ func (t *systemTicker) ticks() <-chan time.Time {
+ 	if t == nil || t.ticker == nil {
+ 		return nil
+diff --git a/cmd/gateway/session_supervisor_test.go b/cmd/gateway/session_supervisor_test.go
+index 74c2128..4853251 100644
+--- a/cmd/gateway/session_supervisor_test.go
++++ b/cmd/gateway/session_supervisor_test.go
+@@ -1,13 +1,13 @@
+ package main
+ 
+ // ProofReceipt:
+-// new_dimension: private Gateway runtime session initializer and lifecycle join
+-// residency: resident light behavior/fault plus opt-in faithful SQLite cold composition
++// new_dimension: FirstBoot Source promotion between current0 and current1, plus lifecycle join
++// residency: resident light promotion/fault behavior plus opt-in faithful SQLite cold composition
+ // class: Ψ_light; faithful SQLite cold path is Ψ_heavy opt-in
+-// budget: light wall<=20s,RSS<=512MiB,temp_write<=128MiB; heavy wall<=120s,RSS<=1GiB,temp_write<=1GiB
+-// identity: TestSessionSupervisorResident/TestSessionSupervisorColdSQLite/RuntimeSession.CallerGate
+-// owner: Gateway dormant runtime session supervisor
+-// collapse: retain controlled ticker, exact caller witness, and cold receipt; discard temp DBs and logs
++// budget: light wall<=20s,RSS<=512MiB,read_write<=256MiB,network=0,subprocess=0,concurrency=1; heavy wall<=180s,RSS<=1GiB,IO<=2GiB,network=0,subprocess<=6,concurrency=1
++// identity: TestSessionSupervisorPromotion/TestSessionSupervisorResident/TestSessionSupervisorColdSQLite/RuntimeSession.CallerGate
++// owner: Gateway initial Source promotion and runtime session supervisor
++// collapse: retain controlled current0/current1 and failure witnesses plus cold receipt; discard temp DBs and logs
+ 
+ import (
+ 	"context"
+@@ -17,9 +17,13 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"go/ast"
++	"go/parser"
++	"go/token"
+ 	"os"
+ 	"path/filepath"
+ 	"reflect"
++	stdruntime "runtime"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -28,6 +32,7 @@ import (
+ 	_ "modernc.org/sqlite"
+ 	intentinventory "polaris/internal/application/intentinventory"
+ 	"polaris/internal/config"
++	sourceowner "polaris/internal/runtime/source"
+ 	runtime "polaris/internal/runtime_truth"
+ 	storeiface "polaris/internal/store"
+ 	intentv1 "polaris/pkg/contracts/intent/v1"
+@@ -52,6 +57,10 @@ type sessionAuthorityFake struct {
+ 	renewals uint64
+ }
+ 
++func (s *sessionAuthorityFake) InspectInitialSourceBranch(context.Context, storeiface.SourceAuthorityLookupV1) (storeiface.InitialSourceBranchResultV1, error) {
++	return storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchFirstBootV1}, nil
++}
++
+ func (s *sessionAuthorityFake) PublishRuntimeEpoch(context.Context, runtime.RuntimePublishRequest) (runtime.RuntimeEpochResult, error) {
+ 	return runtime.RuntimeEpochResult{Kind: runtime.RuntimeEpochPublished, Record: s.record}, nil
+ }
+@@ -75,6 +84,25 @@ func (s *sessionAuthorityFake) TransitionRuntimeSession(_ context.Context, input
+ 	return storeiface.RuntimeSessionResult{Kind: storeiface.RuntimeSessionRenewed, Current: next}, nil
+ }
+ 
++type sessionSourceOwnerFake struct{}
++
++func (*sessionSourceOwnerFake) RegisterInitialCandidate(context.Context, sourceowner.SourceBootstrap) (storeiface.SourceAuthorityCurrentV1, error) {
++	return storeiface.SourceAuthorityCurrentV1{}, fmt.Errorf("synthetic source owner is not used by prepared tests")
++}
++
++type promotionOwnerFake struct {
++	result storeiface.SourceAuthorityCurrentV1
++	err    error
++	calls  int
++	input  sourceowner.SourceBootstrap
++}
++
++func (f *promotionOwnerFake) RegisterInitialCandidate(_ context.Context, input sourceowner.SourceBootstrap) (storeiface.SourceAuthorityCurrentV1, error) {
++	f.calls++
++	f.input = input
++	return f.result, f.err
++}
++
+ func syntheticRenew(current storeiface.RuntimeSessionSnapshotV1, number uint64) (storeiface.RuntimeSessionSnapshotV1, error) {
+ 	next := current
+ 	next.Lease.LeaseEpoch = fmt.Sprintf("epoch:synthetic-%d", number)
+@@ -270,6 +298,8 @@ type sessionStoreSpy struct {
+ 	renewErr          error
+ 	closeErr          error
+ 	renewKind         storeiface.RuntimeSessionResultKind
++	renewKinds        []storeiface.RuntimeSessionResultKind
++	renewErrors       []error
+ 	closeKind         storeiface.RuntimeSessionResultKind
+ 	publishKind       runtime.RuntimeEpochResultKind
+ 	publishRecord     runtime.RuntimeEpochRecordV1
+@@ -282,6 +312,30 @@ type sessionStoreSpy struct {
+ 	transitionInputs  []storeiface.RuntimeSessionRequest
+ 	transitionResults []storeiface.RuntimeSessionResult
+ 	closeContextErr   error
++	initialCalls      int
++	initialResults    []storeiface.InitialSourceBranchResultV1
++	initialErrors     []error
++}
++
++func (s *sessionStoreSpy) InspectInitialSourceBranch(ctx context.Context, lookup storeiface.SourceAuthorityLookupV1) (storeiface.InitialSourceBranchResultV1, error) {
++	s.mu.Lock()
++	s.initialCalls++
++	index := s.initialCalls - 1
++	var result storeiface.InitialSourceBranchResultV1
++	if index < len(s.initialResults) {
++		result = s.initialResults[index]
++	}
++	var initialErr error
++	if index < len(s.initialErrors) {
++		initialErr = s.initialErrors[index]
++	}
++	base := s.base
++	scripted := index < len(s.initialResults) || index < len(s.initialErrors)
++	s.mu.Unlock()
++	if scripted {
++		return result, initialErr
++	}
++	return base.InspectInitialSourceBranch(ctx, lookup)
+ }
+ 
+ func (s *sessionStoreSpy) PublishRuntimeEpoch(ctx context.Context, input runtime.RuntimePublishRequest) (runtime.RuntimeEpochResult, error) {
+@@ -332,14 +386,22 @@ func (s *sessionStoreSpy) TransitionRuntimeSession(ctx context.Context, input st
+ 	s.mu.Lock()
+ 	s.transitionCalls++
+ 	s.transitionInputs = append(s.transitionInputs, input)
++	renewIndex := -1
+ 	if input.Action == storeiface.RuntimeSessionRenew {
+ 		s.renewCalls++
++		renewIndex = s.renewCalls - 1
+ 	} else if input.Action == storeiface.RuntimeSessionClose {
+ 		s.closeCalls++
+ 		s.closeContextErr = ctx.Err()
+ 	}
+ 	renewErr, closeErr := s.renewErr, s.closeErr
+ 	renewKind := s.renewKind
++	if renewIndex >= 0 && renewIndex < len(s.renewErrors) {
++		renewErr = s.renewErrors[renewIndex]
++	}
++	if renewIndex >= 0 && renewIndex < len(s.renewKinds) {
++		renewKind = s.renewKinds[renewIndex]
++	}
+ 	closeKind := s.closeKind
+ 	done := s.transitionDone
+ 	s.mu.Unlock()
+@@ -415,13 +477,354 @@ func supervisorStart(t *testing.T) (sessionStart, *sessionStoreSpy) {
+ 		publishRecord:  record,
+ 		resolveRecord:  record,
+ 	}
+-	start, err := prepareSession(context.Background(), spy, process, manifest, time.Second)
++	start, err := prepareSession(context.Background(), spy, process, &sessionSourceOwnerFake{}, manifest, time.Second)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	return start, spy
+ }
+ 
++func launchPrepared(start sessionStart, ticker sessionTicker) (*sessionWait, error) {
++	current, err := initializeSession(start)
++	if err != nil {
++		if !nilPort(ticker) {
++			ticker.stop()
++		}
++		return nil, err
++	}
++	return launchSession(start, current, ticker)
++}
++
++func promotionCurrent(storeRef string) storeiface.SourceAuthorityCurrentV1 {
++	digest := "sha256:" + strings.Repeat("c", 64)
++	return storeiface.SourceAuthorityCurrentV1{
++		ContractVersion: storeiface.SourceAuthorityContractVersionV1,
++		StoreRef:        storeRef,
++		SourceEpoch:     "source-epoch:synthetic",
++		CandidateRef:    digest,
++		RootDigest:      digest,
++	}
++}
++
++func promotionPrepared(t *testing.T, restart bool) (context.Context, context.CancelFunc, sessionStart, *sessionStoreSpy, *promotionOwnerFake, config.RuntimeManifestV1) {
++	t.Helper()
++	process, manifest, record := syntheticProcess(t)
++	first := process.Lease.PreCapture.Source.Branch
++	owner := &promotionOwnerFake{result: promotionCurrent(process.Lease.Lease.Lease.StoreRef)}
++	if restart {
++		current := promotionCurrent(process.Lease.Lease.Lease.StoreRef)
++		first = storeiface.InitialSourceBranchResultV1{
++			Kind:    storeiface.InitialSourceBranchRestartDurableV1,
++			Current: current,
++		}
++		process.Lease.PreCapture.Source.Branch = first
++	} else {
++		first = storeiface.InitialSourceBranchResultV1{Kind: storeiface.InitialSourceBranchFirstBootV1}
++		process.Lease.PreCapture.Source.Branch = first
++	}
++	base := &sessionAuthorityFake{record: record}
++	spy := &sessionStoreSpy{
++		base:           base,
++		transitionDone: make(chan struct{}, 8),
++		publishRecord:  record,
++		resolveRecord:  record,
++		initialResults: []storeiface.InitialSourceBranchResultV1{first},
++	}
++	if !restart {
++		spy.initialResults = append(spy.initialResults, storeiface.InitialSourceBranchResultV1{
++			Kind:    storeiface.InitialSourceBranchRestartDurableV1,
++			Current: owner.result,
++		})
++	}
++	lifecycle, cancel := context.WithCancel(context.Background())
++	start, err := prepareSession(lifecycle, spy, process, owner, manifest, time.Second)
++	if err != nil {
++		cancel()
++		t.Fatal(err)
++	}
++	return lifecycle, cancel, start, spy, owner, manifest
++}
++
++func TestSessionSupervisorPromotion(t *testing.T) {
++	for _, restart := range []bool{false, true} {
++		name := "first boot"
++		if restart {
++			name = "restart"
++		}
++		t.Run(name, func(t *testing.T) {
++			lifecycle, cancel, start, spy, owner, manifest := promotionPrepared(t, restart)
++			wait, err := startSessionSupervisor(lifecycle, spy, start.process, owner, manifest, start.shutdownTimeout)
++			if err != nil || wait == nil {
++				t.Fatalf("wait=%v err=%v", wait, err)
++			}
++			spy.mu.Lock()
++			transitions := append([]storeiface.RuntimeSessionRequest(nil), spy.transitionInputs...)
++			results := append([]storeiface.RuntimeSessionResult(nil), spy.transitionResults...)
++			initialCalls := spy.initialCalls
++			renewCalls, closeCalls := spy.renewCalls, spy.closeCalls
++			spy.mu.Unlock()
++			if restart {
++				if owner.calls != 0 || initialCalls != 1 {
++					t.Fatalf("restart owner calls=%d initial calls=%d", owner.calls, initialCalls)
++				}
++			} else if owner.calls != 1 || initialCalls != 2 || owner.input.Capture == nil || owner.input.SourceRoot != start.process.Lease.PreCapture.Source.MaterialPath {
++				t.Fatalf("first boot owner calls=%d initial calls=%d capture=%v", owner.calls, initialCalls, owner.input.Capture != nil)
++			}
++			if renewCalls != 2 || closeCalls != 0 || len(transitions) != 2 || len(results) != 2 {
++				t.Fatalf("before close renew=%d close=%d transitions=%d results=%d", renewCalls, closeCalls, len(transitions), len(results))
++			}
++			if !restart {
++				current0 := results[0].Current
++				if owner.input.Lease != current0.Lease || owner.input.Lifecycle != current0.LeaseLifecycle || owner.input.StoreRef != current0.Lease.StoreRef || owner.input.WriterRef != current0.Lease.OwnerRef {
++					t.Fatal("FirstBoot SourceBootstrap did not use exact current0")
++				}
++			}
++			cancel()
++			if err := wait.wait(); err != nil {
++				t.Fatal(err)
++			}
++			spy.mu.Lock()
++			closeCalls = spy.closeCalls
++			transitions = append([]storeiface.RuntimeSessionRequest(nil), spy.transitionInputs...)
++			spy.mu.Unlock()
++			if closeCalls != 1 || len(transitions) != 3 || transitions[2].Action != storeiface.RuntimeSessionClose || transitions[2].Current != results[1].Current {
++				t.Fatalf("after close close=%d transitions=%d", closeCalls, len(transitions))
++			}
++		})
++	}
++}
++
++func TestSessionSupervisorPromotionFailures(t *testing.T) {
++	branchCause := errors.New("source branch unavailable")
++	registerCause := errors.New("source register unavailable")
++	readbackCause := errors.New("source readback unavailable")
++	renewCause := errors.New("final renew unavailable")
++	closeCause := errors.New("postcommit close unavailable")
++	cases := []struct {
++		name          string
++		initialResult []storeiface.InitialSourceBranchResultV1
++		initialErrors []error
++		ownerErr      error
++		renewErrors   []error
++		renewKinds    []storeiface.RuntimeSessionResultKind
++		cause         error
++		closeKind     storeiface.RuntimeSessionResultKind
++		closeErr      error
++	}{
++		{name: "branch", initialErrors: []error{branchCause}, cause: branchCause},
++		{name: "register", ownerErr: registerCause, cause: registerCause},
++		{name: "readback", initialErrors: []error{nil, readbackCause}, cause: readbackCause},
++		{name: "final renew", renewErrors: []error{nil, renewCause}, cause: renewCause},
++		{name: "final renew verdict", renewKinds: []storeiface.RuntimeSessionResultKind{"", storeiface.RuntimeSessionStale}},
++		{name: "final renew current", renewKinds: []storeiface.RuntimeSessionResultKind{"", storeiface.RuntimeSessionRenewed}},
++		{name: "postcommit stale close", ownerErr: registerCause, cause: registerCause, closeKind: storeiface.RuntimeSessionStale},
++		{name: "postcommit typed close", ownerErr: registerCause, cause: registerCause, closeErr: &storeiface.RuntimeSessionError{ErrorKind: storeiface.RuntimeSessionUnavailable, Cause: closeCause}},
++	}
++	for _, testCase := range cases {
++		t.Run(testCase.name, func(t *testing.T) {
++			lifecycle, cancel, start, spy, owner, manifest := promotionPrepared(t, false)
++			defer cancel()
++			if len(testCase.initialResult) != 0 {
++				spy.initialResults = testCase.initialResult
++			}
++			if len(testCase.initialErrors) != 0 {
++				spy.initialErrors = testCase.initialErrors
++			}
++			owner.err = testCase.ownerErr
++			spy.renewErrors = testCase.renewErrors
++			spy.renewKinds = testCase.renewKinds
++			spy.closeKind = testCase.closeKind
++			spy.closeErr = testCase.closeErr
++			wait, err := startSessionSupervisor(lifecycle, spy, start.process, owner, manifest, start.shutdownTimeout)
++			if wait != nil || err == nil || (testCase.cause != nil && !errors.Is(err, testCase.cause)) {
++				t.Fatalf("wait=%v err=%v cause=%v", wait, err, testCase.cause)
++			}
++			spy.mu.Lock()
++			renewCalls, closeCalls := spy.renewCalls, spy.closeCalls
++			transitions := append([]storeiface.RuntimeSessionRequest(nil), spy.transitionInputs...)
++			results := append([]storeiface.RuntimeSessionResult(nil), spy.transitionResults...)
++			spy.mu.Unlock()
++			if closeCalls != 1 || len(transitions) == 0 || transitions[len(transitions)-1].Action != storeiface.RuntimeSessionClose {
++				t.Fatalf("renew=%d close=%d transitions=%d", renewCalls, closeCalls, len(transitions))
++			}
++			if len(results) == 0 || transitions[len(transitions)-1].Current != results[0].Current {
++				t.Fatal("failure close did not use the last confirmed current")
++			}
++			if strings.HasPrefix(testCase.name, "final renew") && renewCalls != 2 {
++				t.Fatalf("final renew calls=%d want=2", renewCalls)
++			}
++			if testCase.closeKind != "" && !strings.Contains(err.Error(), string(testCase.closeKind)) {
++				t.Fatalf("close verdict=%v want=%s", err, testCase.closeKind)
++			}
++			if testCase.closeErr != nil {
++				var typed *storeiface.RuntimeSessionError
++				if !errors.As(err, &typed) || !errors.Is(err, closeCause) || typed.Kind() != storeiface.RuntimeSessionUnavailable {
++					t.Fatalf("close uncertainty=%v typed=%v", err, typed)
++				}
++			}
++		})
++	}
++}
++
++func TestSessionSupervisorLaunchFault(t *testing.T) {
++	start, spy := supervisorStart(t)
++	current0, err := initializeSession(start)
++	if err != nil {
++		t.Fatal(err)
++	}
++	renewed, err := renewSession(start.lifecycle, start.store, current0, start.ttlSeconds)
++	if err != nil || renewed.Kind != storeiface.RuntimeSessionRenewed {
++		t.Fatalf("current1=%+v err=%v", renewed, err)
++	}
++	ticker := &manualSessionTicker{}
++	wait, err := launchSession(start, renewed.Current, ticker)
++	if wait != nil || err == nil || ticker.stopped != 1 {
++		t.Fatalf("wait=%v err=%v ticker_stopped=%d", wait, err, ticker.stopped)
++	}
++	spy.mu.Lock()
++	closeCalls := spy.closeCalls
++	spy.mu.Unlock()
++	if closeCalls != 0 {
++		t.Fatalf("launch fault closed session before caller cleanup: %d", closeCalls)
++	}
++}
++
++func TestSessionSupervisorLaunchCurrentStatic(t *testing.T) {
++	_, testFile, _, ok := stdruntime.Caller(0)
++	if !ok {
++		t.Fatal("runtime caller unavailable")
++	}
++	root := filepath.Dir(filepath.Dir(filepath.Dir(testFile)))
++	path := filepath.Join(root, "cmd", "gateway", "session_supervisor.go")
++	source, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	set := token.NewFileSet()
++	file, err := parser.ParseFile(set, path, source, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	launchCount := 0
++	current0Aborts, current1Aborts := 0, 0
++	var launchCall, abortCall *ast.CallExpr
++	for _, declaration := range file.Decls {
++		function, ok := declaration.(*ast.FuncDecl)
++		if !ok || function.Name == nil || function.Name.Name != "startSessionSupervisor" || function.Body == nil {
++			continue
++		}
++		for index, statement := range function.Body.List {
++			assign, ok := statement.(*ast.AssignStmt)
++			if !ok || assign.Tok != token.DEFINE || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
++				continue
++			}
++			left, leftOK := assign.Lhs[0].(*ast.Ident)
++			right, rightOK := assign.Lhs[1].(*ast.Ident)
++			call, callOK := assign.Rhs[0].(*ast.CallExpr)
++			var callee *ast.Ident
++			calleeOK := false
++			if callOK {
++				callee, calleeOK = call.Fun.(*ast.Ident)
++			}
++			if !leftOK || left.Name != "wait" || !rightOK || right.Name != "err" || !callOK || !calleeOK || callee.Name != "launchSession" {
++				continue
++			}
++			launchCount++
++			if launchCount != 1 {
++				t.Fatal("second launchSession assignment")
++			}
++			launchCall = call
++			want := []string{"start", "current1", "nil"}
++			if len(call.Args) != len(want) {
++				t.Fatalf("launchSession args=%d want=%d", len(call.Args), len(want))
++			}
++			for argIndex, argument := range call.Args {
++				ident, ok := argument.(*ast.Ident)
++				if !ok || ident.Name != want[argIndex] {
++					t.Fatalf("launchSession arg%d changed", argIndex)
++				}
++			}
++			if index+1 >= len(function.Body.List) {
++				t.Fatal("launchSession is missing its immediate error guard")
++			}
++			guard, ok := function.Body.List[index+1].(*ast.IfStmt)
++			if !ok || guard.Init != nil || guard.Cond == nil || guard.Body == nil || len(guard.Body.List) != 1 {
++				t.Fatal("launchSession immediate error guard changed")
++			}
++			condition, ok := guard.Cond.(*ast.BinaryExpr)
++			leftCond, leftOK := condition.X.(*ast.Ident)
++			rightCond, rightOK := condition.Y.(*ast.Ident)
++			if !ok || condition.Op != token.NEQ || !leftOK || leftCond.Name != "err" || !rightOK || rightCond.Name != "nil" {
++				t.Fatal("launchSession guard condition changed")
++			}
++			result, ok := guard.Body.List[0].(*ast.ReturnStmt)
++			if !ok || len(result.Results) != 2 || !sourceExpr(result.Results[0], "nil") {
++				t.Fatal("launchSession guard return changed")
++			}
++			guardCall, ok := result.Results[1].(*ast.CallExpr)
++			var guardCallee *ast.Ident
++			calleeOK = false
++			if ok {
++				guardCallee, calleeOK = guardCall.Fun.(*ast.Ident)
++			}
++			if !ok || !calleeOK || guardCallee.Name != "abortSession" || len(guardCall.Args) != 3 || !sourceExpr(guardCall.Args[0], "start") || !sourceExpr(guardCall.Args[1], "current1") || !sourceExpr(guardCall.Args[2], "err") {
++				t.Fatal("launchSession failure path changed")
++			}
++			abortCall = guardCall
++		}
++		allowedAbort := map[*ast.Ident]bool{}
++		ast.Inspect(function.Body, func(node ast.Node) bool {
++			switch value := node.(type) {
++			case *ast.CallExpr:
++				callee, ok := value.Fun.(*ast.Ident)
++				if ok && callee.Name == "launchSession" {
++					if value != launchCall {
++						t.Fatal("second or indirect launchSession call")
++					}
++				}
++				if ok && callee.Name == "abortSession" {
++					allowedAbort[callee] = true
++					if len(value.Args) != 3 || !sourceExpr(value.Args[0], "start") {
++						t.Fatal("abortSession receiver or arity changed")
++					}
++					switch {
++					case sourceExpr(value.Args[1], "current1"):
++						current1Aborts++
++						if value != abortCall || !sourceExpr(value.Args[2], "err") {
++							t.Fatal("current1 abortSession path changed")
++						}
++					case sourceExpr(value.Args[1], "current0"):
++						current0Aborts++
++						if !sourceExpr(value.Args[2], "err") && !sourceExpr(value.Args[2], "cause") {
++							t.Fatal("current0 abortSession cause changed")
++						}
++					default:
++						t.Fatal("abortSession used an old or inferred current")
++					}
++				}
++			case *ast.Ident:
++				if value.Name == "launchSession" && launchCall != nil {
++					callee, ok := launchCall.Fun.(*ast.Ident)
++					if !ok || value != callee {
++						t.Fatal("launchSession escaped as alias")
++					}
++				}
++				if value.Name == "abortSession" && !allowedAbort[value] {
++					t.Fatal("abortSession escaped as alias")
++				}
++			case *ast.SelectorExpr:
++				if value.Sel.Name == "launchSession" || value.Sel.Name == "abortSession" {
++					t.Fatal("launch or abort escaped through selector")
++				}
++			}
++			return true
++		})
++	}
++	if launchCount != 1 || current0Aborts != 4 || current1Aborts != 1 || launchCall == nil || abortCall == nil {
++		t.Fatalf("startSessionSupervisor launch=%d abort-current0=%d abort-current1=%d want=1/4/1", launchCount, current0Aborts, current1Aborts)
++	}
++}
++
+ func syntheticRecordMismatch(record runtime.RuntimeEpochRecordV1) (runtime.RuntimeEpochRecordV1, error) {
+ 	record.ConfigDigest = "sha256:" + strings.Repeat("9", 64)
+ 	origin, err := runtime.ComputeOriginDigest(record)
+@@ -629,7 +1032,7 @@ func TestSessionSupervisorResident(t *testing.T) {
+ 	defer cancel()
+ 	start.lifecycle = lifecycle
+ 	ticker := &manualSessionTicker{channel: make(chan time.Time, 1)}
+-	wait, err := launchSession(start, ticker)
++	wait, err := launchPrepared(start, ticker)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -786,7 +1189,7 @@ func TestSessionSupervisorResidentInitializer(t *testing.T) {
+ 			defer cancel()
+ 			start.lifecycle = lifecycle
+ 			ticker := &manualSessionTicker{channel: make(chan time.Time)}
+-			wait, err := launchSession(start, ticker)
++			wait, err := launchPrepared(start, ticker)
+ 			if testCase.succeed {
+ 				if err != nil || wait == nil {
+ 					t.Fatalf("retry wait=%v err=%v", wait, err)
+@@ -826,7 +1229,7 @@ func TestSessionSupervisorResidentInitialVerdict(t *testing.T) {
+ 	spy.renewKind = storeiface.RuntimeSessionMissing
+ 	spy.mu.Unlock()
+ 	ticker := &manualSessionTicker{channel: make(chan time.Time)}
+-	wait, err := launchSession(start, ticker)
++	wait, err := launchPrepared(start, ticker)
+ 	if wait != nil || err == nil {
+ 		t.Fatalf("initial verdict wait=%v err=%v", wait, err)
+ 	}
+@@ -855,7 +1258,7 @@ func TestSessionSupervisorResidentTickVerdicts(t *testing.T) {
+ 			defer cancel()
+ 			start.lifecycle = lifecycle
+ 			ticker := &manualSessionTicker{channel: make(chan time.Time, 1)}
+-			wait, err := launchSession(start, ticker)
++			wait, err := launchPrepared(start, ticker)
+ 			if err != nil {
+ 				t.Fatal(err)
+ 			}
+@@ -891,7 +1294,7 @@ func TestSessionSupervisorResidentRenewErrors(t *testing.T) {
+ 			defer cancel()
+ 			start.lifecycle = lifecycle
+ 			ticker := &manualSessionTicker{channel: make(chan time.Time, 1)}
+-			wait, err := launchSession(start, ticker)
++			wait, err := launchPrepared(start, ticker)
+ 			if err != nil {
+ 				t.Fatal(err)
+ 			}
+@@ -921,7 +1324,7 @@ func TestSessionSupervisorResidentRenewErrors(t *testing.T) {
+ 		defer cancel()
+ 		start.lifecycle = lifecycle
+ 		ticker := &manualSessionTicker{channel: make(chan time.Time, 1)}
+-		wait, err := launchSession(start, ticker)
++		wait, err := launchPrepared(start, ticker)
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+@@ -1195,12 +1598,12 @@ func TestSessionSupervisorColdSQLite(t *testing.T) {
+ 	spy := &sessionStoreSpy{base: fixture.store, transitionDone: make(chan struct{}, 8)}
+ 	lifecycle, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+-	start, err := prepareSession(lifecycle, spy, process, fixture.manifest, time.Second)
++	start, err := prepareSession(lifecycle, spy, process, &sessionSourceOwnerFake{}, fixture.manifest, time.Second)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	ticker := &manualSessionTicker{channel: make(chan time.Time, 2)}
+-	wait, err := launchSession(start, ticker)
++	wait, err := launchPrepared(start, ticker)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/internal/store/sqlite/initial_source_branch_test.go b/internal/store/sqlite/initial_source_branch_test.go
+index 96b5c7d..96fcbd1 100644
+--- a/internal/store/sqlite/initial_source_branch_test.go
++++ b/internal/store/sqlite/initial_source_branch_test.go
+@@ -549,6 +549,10 @@ func checkGatewayCalls(t *testing.T, root string) {
+ 	fileSet := token.NewFileSet()
+ 	branchCount := 0
+ 	materialCount := 0
++	composeBranches := []int{}
++	composeMaterials := []int{}
++	promotionBranches := []int{}
++	seen := map[*ast.SelectorExpr]bool{}
+ 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+ 		if walkErr != nil {
+ 			return walkErr
+@@ -579,37 +583,64 @@ func checkGatewayCalls(t *testing.T, root string) {
+ 			walker := &callerWalk{calls: calls}
+ 			ast.Walk(walker, fn.Body)
+ 			for _, site := range walker.sites {
+-				if site.depth != 0 || site.call == nil {
++				if site.depth != 0 || site.nested || site.call == nil {
+ 					t.Fatalf("nested or method-value caller: %s/%s", path, fn.Name.Name)
+ 				}
+ 				relative, err := filepath.Rel(root, path)
+ 				if err != nil {
+ 					t.Fatalf("caller path: %v", err)
+ 				}
+-				if filepath.ToSlash(relative) != "cmd/gateway/bootstrap_source.go" || fn.Name.Name != "composeSource" {
+-					t.Fatalf("caller escaped composeSource: %s/%s", path, fn.Name.Name)
++				if filepath.ToSlash(relative) != "cmd/gateway/bootstrap_source.go" || (fn.Name.Name != "composeSource" && fn.Name.Name != "promoteSource") {
++					t.Fatalf("caller escaped Gateway source owner: %s/%s", path, fn.Name.Name)
+ 				}
+ 				if site.selector.Sel.Name == "InspectInitialSourceBranch" {
++					seen[site.selector] = true
+ 					branchCount++
+-					if !sameExpr(site.selector.X, "initial") || len(site.call.Args) != 2 || !sameExpr(site.call.Args[0], "ctx") || !sameExpr(site.call.Args[1], "lookup") {
+-						t.Fatal("branch caller receiver or arguments changed")
++					if fn.Name.Name == "composeSource" {
++						composeBranches = append(composeBranches, fileSet.Position(site.selector.Pos()).Line)
++						if !sameExpr(site.selector.X, "initial") || len(site.call.Args) != 2 || !sameExpr(site.call.Args[0], "ctx") || !sameExpr(site.call.Args[1], "lookup") {
++							t.Fatal("compose branch caller receiver or arguments changed")
++						}
++					} else {
++						promotionBranches = append(promotionBranches, fileSet.Position(site.selector.Pos()).Line)
++						if !sameExpr(site.selector.X, "start.store") || len(site.call.Args) != 2 || !sameExpr(site.call.Args[0], "start.lifecycle") || !sameExpr(site.call.Args[1], "lookup") {
++							t.Fatal("promotion branch caller receiver or arguments changed")
++						}
+ 					}
+ 				}
+ 				if site.selector.Sel.Name == "InspectCandidateMaterial" {
++					seen[site.selector] = true
+ 					materialCount++
+-					if !sameExpr(site.selector.X, "material") || len(site.call.Args) != 2 || !sameExpr(site.call.Args[0], "ctx") || !sameExpr(site.call.Args[1], "first") {
++					if fn.Name.Name != "composeSource" || !sameExpr(site.selector.X, "material") || len(site.call.Args) != 2 || !sameExpr(site.call.Args[0], "ctx") || !sameExpr(site.call.Args[1], "first") {
+ 						t.Fatal("material caller receiver or arguments changed")
+ 					}
++					composeMaterials = append(composeMaterials, fileSet.Position(site.selector.Pos()).Line)
+ 				}
+ 			}
+ 		}
++		ast.Inspect(parsed, func(node ast.Node) bool {
++			selector, ok := node.(*ast.SelectorExpr)
++			if !ok || (selector.Sel.Name != "InspectInitialSourceBranch" && selector.Sel.Name != "InspectCandidateMaterial") {
++				return true
++			}
++			if !seen[selector] {
++				t.Fatalf("production inspector method value or alias: %s", path)
++			}
++			return true
++		})
+ 		return nil
+ 	})
+ 	if err != nil {
+ 		t.Fatalf("walk production callers: %v", err)
+ 	}
+-	if branchCount != 2 || materialCount != 1 {
+-		t.Fatalf("production callers branch=%d material=%d", branchCount, materialCount)
++	if branchCount != 4 || materialCount != 1 || len(composeBranches) != 2 || len(composeMaterials) != 1 || len(promotionBranches) != 2 {
++		t.Fatalf("production callers branch=%d material=%d compose=%v/%v promote=%v", branchCount, materialCount, composeBranches, composeMaterials, promotionBranches)
++	}
++	if !(composeBranches[0] < composeMaterials[0] && composeMaterials[0] < composeBranches[1]) {
++		t.Fatalf("compose caller order branch=%v material=%v", composeBranches, composeMaterials)
++	}
++	if !(promotionBranches[0] < promotionBranches[1]) {
++		t.Fatalf("promotion caller order=%v", promotionBranches)
+ 	}
+ }
+ 
+@@ -617,35 +648,49 @@ type callerSite struct {
+ 	selector *ast.SelectorExpr
+ 	call     *ast.CallExpr
+ 	depth    int
++	nested   bool
++}
++
++type callerFrame struct {
++	funcLit bool
++	call    bool
+ }
+ 
+ type callerWalk struct {
+-	calls map[*ast.SelectorExpr]*ast.CallExpr
+-	depth int
+-	stack []bool
+-	sites []callerSite
++	calls     map[*ast.SelectorExpr]*ast.CallExpr
++	depth     int
++	callDepth int
++	stack     []callerFrame
++	sites     []callerSite
+ }
+ 
+ func (w *callerWalk) Visit(node ast.Node) ast.Visitor {
+ 	if node == nil {
+ 		last := len(w.stack) - 1
+ 		if last >= 0 {
+-			if w.stack[last] {
++			if w.stack[last].funcLit {
+ 				w.depth--
+ 			}
++			if w.stack[last].call {
++				w.callDepth--
++			}
+ 			w.stack = w.stack[:last]
+ 		}
+ 		return w
+ 	}
+-	funcLit := false
++	frame := callerFrame{}
+ 	if _, ok := node.(*ast.FuncLit); ok {
+-		funcLit = true
++		frame.funcLit = true
+ 		w.depth++
+ 	}
+-	w.stack = append(w.stack, funcLit)
++	if _, ok := node.(*ast.CallExpr); ok {
++		frame.call = true
++		w.callDepth++
++	}
++	w.stack = append(w.stack, frame)
+ 	selector, ok := node.(*ast.SelectorExpr)
+ 	if ok && (selector.Sel.Name == "InspectInitialSourceBranch" || selector.Sel.Name == "InspectCandidateMaterial") {
+-		w.sites = append(w.sites, callerSite{selector: selector, call: w.calls[selector], depth: w.depth})
++		w.sites = append(w.sites, callerSite{selector: selector, call: w.calls[selector], depth: w.depth, nested: w.callDepth > 1})
+ 	}
+ 	return w
+ }

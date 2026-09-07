@@ -1,0 +1,849 @@
+diff --git a/internal/analysis/sqliteinventory/adapter_return_test.go b/internal/analysis/sqliteinventory/adapter_return_test.go
+index 44cb27d..53a4c94 100644
+--- a/internal/analysis/sqliteinventory/adapter_return_test.go
++++ b/internal/analysis/sqliteinventory/adapter_return_test.go
+@@ -125,7 +125,6 @@ func TestProductionInventoryDiagnostics(t *testing.T) {
+ 		file, message string
+ 		line          int
+ 	}{
+-		{"internal/store/sqlite/input_ledger.go", "unknown control-flow value", 193},
+ 		{"internal/store/sqlite/runtime_failure_joinery.go", "SQL value or SQL shape is not statically proven", 226},
+ 	}
+ 	if err == nil || len(report.Diagnostics) != len(want) {
+diff --git a/internal/analysis/sqliteinventory/flow_if.go b/internal/analysis/sqliteinventory/flow_if.go
+index b42eee9..71a5fb6 100644
+--- a/internal/analysis/sqliteinventory/flow_if.go
++++ b/internal/analysis/sqliteinventory/flow_if.go
+@@ -33,17 +33,64 @@ func (a *analyzer) scanIf(statement *ast.IfStmt, env valueEnv) blockResult {
+ 		result = append(result, predicate.failed...)
+ 		for _, path := range predicate.normal {
+ 			selected := a.projectPred(statement.Cond, path)
++			parents := snapshotIfBranches(selected)
+ 			if path.truth {
+-				trueExits = append(trueExits, a.scanBlock(statement.Body, selected).exits...)
++				exits := a.scanBlock(statement.Body, selected).exits
++				trueExits = append(trueExits, restoreIfBranches(exits, parents)...)
+ 				continue
+ 			}
+ 			if statement.Else == nil {
+ 				falseExits = append(falseExits, normalExit(selected))
+ 				continue
+ 			}
+-			falseExits = append(falseExits, a.scanStmt(statement.Else, selected).exits...)
++			exits := a.scanStmt(statement.Else, selected).exits
++			falseExits = append(falseExits, restoreIfBranches(exits, parents)...)
+ 		}
+ 	}
+ 	result = append(result, mergePathExits(trueExits, falseExits, a.limit())...)
+ 	return a.projectScope(frame, blockResult{exits: mergeTypedExits(result, a.limit())})
+ }
++
++func snapshotIfBranches(selected valueEnv) map[string]branchState {
++	parents := make(map[string]branchState)
++	for id := range selected.branchGuards {
++		sequence, ok := sequenceByID(selected, id)
++		if !ok {
++			continue
++		}
++		branch := branchFor(selected, "", sequence)
++		if branch.id == "" {
++			continue
++		}
++		if branch.path != branchThen && branch.path != branchElse {
++			continue
++		}
++		parents[id] = branch
++	}
++	return parents
++}
++
++func restoreIfBranches(exits []typedExit, parents map[string]branchState) []typedExit {
++	for index := range exits {
++		if exits[index].kind != exitNormal {
++			continue
++		}
++		cloned := false
++		for id, parent := range parents {
++			sequence, ok := sequenceByID(exits[index].env, id)
++			if !ok || sequence.unknown || sequence.version != parent.sequenceVersion || !sameBinding(sequence.binding, parent.binding) {
++				continue
++			}
++			current := branchFor(exits[index].env, "", sequence)
++			if current.id == "" || current.id == parent.id || current.path != branchUnknown {
++				continue
++			}
++			if !cloned {
++				exits[index].env = exits[index].env.clone()
++				cloned = true
++			}
++			exits[index].env.branchGuards[id] = parent
++		}
++	}
++	return exits
++}
+diff --git a/internal/analysis/sqliteinventory/sequence_join.go b/internal/analysis/sqliteinventory/sequence_join.go
+index fbc60d7..a6b59fa 100644
+--- a/internal/analysis/sqliteinventory/sequence_join.go
++++ b/internal/analysis/sqliteinventory/sequence_join.go
+@@ -1,5 +1,10 @@
+ package sqliteinventory
+ 
++import (
++	"reflect"
++	"strings"
++)
++
+ // sequenceJoinProof is built only from the two environments being joined.
+ // A string prefix is not evidence: both paths must carry the same typed source
+ // sequence, version, and complementary source-position length guard.
+@@ -140,5 +145,230 @@ func joinValueAtPaths(left, right SQLValue, leftEnv, rightEnv valueEnv, limit in
+ 		}
+ 		return unknownValue("exact path is not the proven empty sequence witness")
+ 	}
+-	return joinValue(left, right, limit)
++	if left.Kind != Template || right.Kind != Template {
++		return joinValue(left, right, limit)
++	}
++	if !stageCandidate(left, right) {
++		return joinValue(left, right, limit)
++	}
++	if !sameStageSource(left, right, leftEnv, rightEnv) {
++		return unknownValue("staged sequence proof is stale")
++	}
++	equal := equalSequenceTemplate(left, right)
++	if equal && !stageCarry(left, right, leftEnv, rightEnv) {
++		return unknownValue("staged sequence receipt is stale")
++	}
++	if equal {
++		return left
++	}
++	if value, ok := joinStageConnector(left, right, leftEnv, rightEnv); ok {
++		return value
++	}
++	if value, ok := joinStageAtom(left, right, leftEnv, rightEnv); ok {
++		return value
++	}
++	return unknownValue("staged sequence alternatives lack complementary proof")
++}
++
++func stageCandidate(left, right SQLValue) bool {
++	leftBound := left.SequenceGuard
++	rightBound := right.SequenceGuard
++	if left.SequenceID == "" || left.SequenceID != right.SequenceID || left.SequenceVersion != right.SequenceVersion || left.SequenceSep == "" || left.SequenceSep != right.SequenceSep {
++		return false
++	}
++	if leftBound == nil || rightBound == nil || leftBound.GuardKind != "length" || rightBound.GuardKind != "length" || !leftBound.AllowsEmpty || !rightBound.AllowsEmpty {
++		return false
++	}
++	return leftBound.SourceSequenceID != "" && leftBound.SourceSequenceID == rightBound.SourceSequenceID && leftBound.SourceSequenceVersion == rightBound.SourceSequenceVersion
++}
++
++func sameStageSource(left, right SQLValue, leftEnv, rightEnv valueEnv) bool {
++	if left.SequenceID == "" || left.SequenceID != right.SequenceID || left.SequenceVersion != right.SequenceVersion {
++		return false
++	}
++	if left.SequenceSep == "" || left.SequenceSep != right.SequenceSep || !reflect.DeepEqual(left.Sequence, right.Sequence) {
++		return false
++	}
++	leftBound := left.SequenceGuard
++	rightBound := right.SequenceGuard
++	if leftBound == nil || rightBound == nil || !leftBound.AllowsEmpty || !rightBound.AllowsEmpty {
++		return false
++	}
++	if leftBound.GuardKind != "length" || rightBound.GuardKind != "length" || leftBound.SourceSequenceID == "" || leftBound.SourceSequenceID != rightBound.SourceSequenceID || leftBound.SourceSequenceVersion != rightBound.SourceSequenceVersion {
++		return false
++	}
++	leftTarget, leftOK := sequenceByID(leftEnv, left.SequenceID)
++	rightTarget, rightOK := sequenceByID(rightEnv, right.SequenceID)
++	if !leftOK || !rightOK || !stageStateCurrent(leftTarget, left.SequenceID, left.SequenceVersion) || !stageStateCurrent(rightTarget, right.SequenceID, right.SequenceVersion) {
++		return false
++	}
++	if !sameBinding(leftTarget.binding, rightTarget.binding) {
++		return false
++	}
++	leftSource, leftOK := sequenceByID(leftEnv, leftBound.SourceSequenceID)
++	rightSource, rightOK := sequenceByID(rightEnv, rightBound.SourceSequenceID)
++	if !leftOK || !rightOK || !stageStateCurrent(leftSource, leftBound.SourceSequenceID, leftBound.SourceSequenceVersion) || !stageStateCurrent(rightSource, rightBound.SourceSequenceID, rightBound.SourceSequenceVersion) {
++		return false
++	}
++	if !sameBinding(leftSource.binding, rightSource.binding) {
++		return false
++	}
++	if leftTarget.boundarySequenceID != "" && (leftTarget.boundarySequenceID != leftBound.SourceSequenceID || leftTarget.boundarySequenceVersion != leftBound.SourceSequenceVersion) {
++		return false
++	}
++	if rightTarget.boundarySequenceID != "" && (rightTarget.boundarySequenceID != rightBound.SourceSequenceID || rightTarget.boundarySequenceVersion != rightBound.SourceSequenceVersion) {
++		return false
++	}
++	return true
++}
++
++func stageStateCurrent(state sequenceState, id string, version int) bool {
++	return !state.unknown && state.id == id && state.version == version && state.binding != nil
++}
++
++func stageCarry(left, right SQLValue, leftEnv, rightEnv valueEnv) bool {
++	if !sequenceShapeSafe(left) || !sequenceShapeSafe(right) {
++		return false
++	}
++	if !sameStageSource(left, right, leftEnv, rightEnv) {
++		return false
++	}
++	leftSequence, leftOK := sequenceByID(leftEnv, left.SequenceID)
++	rightSequence, rightOK := sequenceByID(rightEnv, right.SequenceID)
++	if !leftOK || !rightOK {
++		return false
++	}
++	if _, leftOK := sequenceBoundaryReceiptFor(leftEnv, left, leftSequence); !leftOK {
++		return false
++	}
++	if _, rightOK := sequenceBoundaryReceiptFor(rightEnv, right, rightSequence); !rightOK {
++		return false
++	}
++	return true
++}
++
++func stageGuard(env valueEnv, value SQLValue) (guardState, bool) {
++	bound := value.SequenceGuard
++	if bound == nil || bound.GuardID == "" || bound.SourceSequenceID == "" {
++		return guardState{}, false
++	}
++	sequence, ok := sequenceByID(env, bound.SourceSequenceID)
++	if !ok || !stageStateCurrent(sequence, bound.SourceSequenceID, bound.SourceSequenceVersion) {
++		return guardState{}, false
++	}
++	guard := guardFor(env, "", sequence)
++	if guard.sequenceID != sequence.id || guard.sequenceVersion != sequence.version || !sameBinding(guard.binding, sequence.binding) {
++		return guardState{}, false
++	}
++	if !guardCardinalityMatches(guard) {
++		return guardState{}, false
++	}
++	return guard, true
++}
++
++func joinStageConnector(left, right SQLValue, leftEnv, rightEnv valueEnv) (SQLValue, bool) {
++	if !sameStageSource(left, right, leftEnv, rightEnv) {
++		return SQLValue{}, false
++	}
++	if left.SequenceGuard.GuardID == "" || left.SequenceGuard.GuardID != right.SequenceGuard.GuardID {
++		return SQLValue{}, false
++	}
++	leftGuard, leftOK := stageGuard(leftEnv, left)
++	rightGuard, rightOK := stageGuard(rightEnv, right)
++	if !leftOK || !rightOK || complementaryGuard(leftGuard, rightGuard) == "" {
++		return SQLValue{}, false
++	}
++	empty, nonempty := left, right
++	if leftGuard.path == guardPathNonEmpty {
++		empty, nonempty = right, left
++	}
++	emptyBound := empty.SequenceGuard
++	nonemptyBound := nonempty.SequenceGuard
++	if empty.SequencePre != emptyBound.CommonPrefix || empty.SequencePost != emptyBound.CommonSuffix || nonempty.SequencePre != nonemptyBound.CommonPrefix || nonempty.SequencePost != nonemptyBound.CommonSuffix {
++		return SQLValue{}, false
++	}
++	if emptyBound.NonEmptyPrefix != nonemptyBound.NonEmptyPrefix || emptyBound.NonEmptySuffix != nonemptyBound.NonEmptySuffix {
++		return SQLValue{}, false
++	}
++	emptyText := empty.SequencePre + empty.SequencePost
++	nonemptyPre := nonempty.SequencePre + nonemptyBound.NonEmptyPrefix
++	if emptyText == "" || emptyText != nonemptyPre {
++		return SQLValue{}, false
++	}
++	if nonemptyBound.NonEmptySuffix+nonempty.SequencePost != nonempty.SequenceSep {
++		return SQLValue{}, false
++	}
++	result := nonempty
++	result.SequencePre = emptyText
++	result.SequencePost = ""
++	bound := *nonemptyBound
++	bound.GuardID = nonemptyGuardID(leftGuard, rightGuard)
++	bound.CommonPrefix = result.SequencePre
++	bound.CommonSuffix = ""
++	bound.NonEmptyPrefix = ""
++	bound.NonEmptySuffix += nonempty.SequencePost
++	result.SequenceGuard = &bound
++	result.Reason = "staged sequence connector"
++	return result, true
++}
++
++func nonemptyGuardID(left, right guardState) string {
++	if left.id == right.id {
++		return left.id
++	}
++	return ""
++}
++
++func joinStageAtom(left, right SQLValue, leftEnv, rightEnv valueEnv) (SQLValue, bool) {
++	if !sameStageSource(left, right, leftEnv, rightEnv) {
++		return SQLValue{}, false
++	}
++	leftSeq, leftOK := sequenceByID(leftEnv, left.SequenceID)
++	rightSeq, rightOK := sequenceByID(rightEnv, right.SequenceID)
++	if !leftOK || !rightOK {
++		return SQLValue{}, false
++	}
++	if _, ok := sequenceBoundaryReceiptFor(leftEnv, left, leftSeq); !ok {
++		return SQLValue{}, false
++	}
++	if _, ok := sequenceBoundaryReceiptFor(rightEnv, right, rightSeq); !ok {
++		return SQLValue{}, false
++	}
++	evidence := complementaryBranch(branchFor(leftEnv, "", leftSeq), branchFor(rightEnv, "", rightSeq))
++	if evidence == "" {
++		return SQLValue{}, false
++	}
++	base, extended := left, right
++	leftBranch := branchFor(leftEnv, "", leftSeq)
++	if leftBranch.path == branchThen {
++		base, extended = right, left
++	}
++	baseBound := base.SequenceGuard
++	extBound := extended.SequenceGuard
++	if base.SequencePre != baseBound.CommonPrefix || base.SequencePost != baseBound.CommonSuffix || extended.SequencePre != extBound.CommonPrefix || extended.SequencePost != extBound.CommonSuffix {
++		return SQLValue{}, false
++	}
++	if baseBound.NonEmptyPrefix == "" || extended.SequencePre != base.SequencePre+baseBound.NonEmptyPrefix {
++		return SQLValue{}, false
++	}
++	if extBound.NonEmptyPrefix != "" || extBound.NonEmptySuffix != baseBound.NonEmptySuffix+base.SequenceSep || !strings.HasSuffix(extended.SequencePost, base.SequencePost) {
++		return SQLValue{}, false
++	}
++	extra := strings.TrimSuffix(extended.SequencePost, base.SequencePost)
++	role := sequenceRole(base.SequenceSep, extra)
++	if extra == "" || role == "" {
++		return SQLValue{}, false
++	}
++	if len(base.Sequence) >= predAltCap {
++		return SQLValue{}, false
++	}
++	result := base
++	result.Sequence = append([]SequenceAtom(nil), base.Sequence...)
++	result.Sequence = append(result.Sequence, SequenceAtom{Value: exactValue(extra), Presence: SequenceOptional, Proof: FragmentProof{Role: role, Separator: base.SequenceSep, GuardID: evidence, ControlKind: "branch"}, MinCount: 0, MaxCount: 1})
++	result.SequenceGuard = cloneSequenceBoundary(baseBound)
++	if !sequenceShapeSafe(result) {
++		return SQLValue{}, false
++	}
++	result.Reason = "staged optional sequence atom"
++	return result, true
+ }
+diff --git a/internal/analysis/sqliteinventory/sequence_stage_test.go b/internal/analysis/sqliteinventory/sequence_stage_test.go
+new file mode 100644
+index 0000000..ba61cbc
+--- /dev/null
++++ b/internal/analysis/sqliteinventory/sequence_stage_test.go
+@@ -0,0 +1,500 @@
++package sqliteinventory
++
++import (
++	"go/token"
++	"go/types"
++	"path/filepath"
++	"reflect"
++	"strconv"
++	"strings"
++	"testing"
++)
++
++func TestSequenceStageProduction(t *testing.T) {
++	repo := filepath.Clean(filepath.Join(packageDir(t), "..", "..", ".."))
++	report, err := Analyze(repo, Options{Roots: []string{"internal/store/sqlite"}, SQLRoots: []string{"internal/store/sqlite"}})
++	if err == nil || len(report.Diagnostics) != 1 || countDiagnostics(report.Diagnostics, "unknown_sql") != 1 {
++		t.Fatalf("input ledger did not leave only known diagnostic: err=%v diagnostics=%+v", err, report.Diagnostics)
++	}
++	execution := executionForFunction(report.Executions, "ListInputLedgerEvents")
++	if execution == nil {
++		t.Fatalf("missing input ledger execution: %+v", report.Executions)
++	}
++	if !execution.Complete || execution.Value.Kind != Template || !execution.Value.SequenceGuard.AllowsEmpty || execution.Fact.Target != "input_ledger_events" {
++		t.Fatalf("input ledger receipt incomplete: %+v", *execution)
++	}
++	texts, ok := corpusWitnesses(execution.Value)
++	if !ok || !variantsContain(texts, " ORDER BY created_at ASC, input_id ASC") || execution.Value.NumericTail == nil || !execution.Value.NumericTail.Optional {
++		t.Fatalf("input ledger witnesses incomplete: ok=%t texts=%+v value=%+v", ok, texts, execution.Value)
++	}
++	for _, fragment := range []string{"input_id = ?", "source_kind = ?", "source_ref = ?", "root_ref = ?", "task_id = ?", "input_type = ?", "event_kind = ?", "classification = ?", "promotion_state = ?"} {
++		if !variantsContain(texts, fragment) {
++			t.Fatalf("input ledger witness missed %q: %+v", fragment, texts)
++		}
++	}
++	active := "superseded_by_input_id = '' AND promotion_state <> ? AND (expires_at = '' OR expires_at > ?)"
++	if !variantsContain(texts, active) {
++		t.Fatalf("input ledger witness missed active-only predicate %q: %+v", active, texts)
++	}
++}
++
++func TestSequenceStageFixture(t *testing.T) {
++	cases := []struct {
++		name string
++		body string
++		want bool
++	}{
++		{name: "positive", body: `if len(clauses) > 0 {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++if active {
++    if len(clauses) == 0 { query += " WHERE " } else { query += " AND " }
++    query += "active = ?"
++}
++`, want: true},
++		{name: "pending", body: `if flag {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++`, want: false},
++		{name: "dynamic", body: `if len(clauses) > 0 && flag {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++query += input
++`, want: false},
++	}
++	for _, test := range cases {
++		t.Run(test.name, func(t *testing.T) {
++			report, err := Analyze(writeFixture(t, stageSource(test.body)), Options{})
++			if countDiagnostics(report.Diagnostics, "typecheck_error") != 0 {
++				t.Fatalf("typecheck diagnostics=%+v", report.Diagnostics)
++			}
++			if len(report.Executions) != 1 {
++				t.Fatalf("executions=%+v diagnostics=%+v", report.Executions, report.Diagnostics)
++			}
++			execution := report.Executions[0]
++			if test.want && (err != nil || !execution.Complete || execution.Value.Kind != Template || execution.Value.SequenceGuard == nil || !execution.Value.SequenceGuard.AllowsEmpty) {
++				t.Fatalf("stage receipt missing: err=%v execution=%+v diagnostics=%+v", err, execution, report.Diagnostics)
++			}
++			if test.want {
++				return
++			}
++			if err == nil || execution.Complete || len(report.Diagnostics) != 1 || countDiagnostics(report.Diagnostics, "unknown_sql") != 1 {
++				t.Fatalf("stage rejection missing: err=%v execution=%+v diagnostics=%+v", err, execution, report.Diagnostics)
++			}
++		})
++	}
++}
++
++func stagePaths(count int) (SQLValue, SQLValue, valueEnv, valueEnv) {
++	binding := types.NewVar(token.NoPos, nil, "clauses", types.NewSlice(types.Typ[types.String]))
++	atoms := make([]sequenceAtom, count)
++	values := make([]SequenceAtom, count)
++	for index := range atoms {
++		atoms[index] = sequenceAtom{value: exactValue("status = ?"), presence: SequenceRequired, minCount: 1, maxCount: 1}
++		values[index] = SequenceAtom{Value: exactValue("status = ?"), Presence: SequenceRequired, Proof: FragmentProof{Role: "predicate", Separator: " AND "}, MinCount: 1, MaxCount: 1}
++	}
++	leftEnv := newEnv()
++	rightEnv := newEnv()
++	leftEnv.sequences["stage"] = sequenceState{id: "stage", version: 1, binding: binding, atoms: atoms}
++	rightEnv.sequences["stage"] = sequenceState{id: "stage", version: 1, binding: binding, atoms: append([]sequenceAtom(nil), atoms...)}
++	leftEnv.guards["stage"] = guardState{id: "guard", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: guardPathNonEmpty, minCount: 1, maxCount: -1}
++	rightEnv.guards["stage"] = leftEnv.guards["stage"]
++	leftEnv.branchGuards["stage"] = branchState{id: "branch", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchThen}
++	rightEnv.branchGuards["stage"] = branchState{id: "branch", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchElse}
++	boundary := func(prefix, suffix, nonemptyPrefix, nonemptySuffix string) *SequenceBoundary {
++		return &SequenceBoundary{GuardID: "guard", GuardKind: "length", SourceSequenceID: "stage", SourceSequenceVersion: 1, CommonPrefix: prefix, CommonSuffix: suffix, AllowsEmpty: true, NonEmptyPrefix: nonemptyPrefix, NonEmptySuffix: nonemptySuffix}
++	}
++	left := SQLValue{Kind: Template, Sequence: append([]SequenceAtom(nil), values...), SequenceID: "stage", SequenceVersion: 1, SequenceSep: " AND ", SequencePre: "SELECT id FROM tasks WHERE ", SequencePost: "active = ?", SequenceGuard: boundary("SELECT id FROM tasks WHERE ", "active = ?", "", " AND ")}
++	rightValues := append([]SequenceAtom(nil), values...)
++	right := SQLValue{Kind: Template, Sequence: rightValues, SequenceID: "stage", SequenceVersion: 1, SequenceSep: " AND ", SequencePre: "SELECT id FROM tasks", SequenceGuard: boundary("SELECT id FROM tasks", "", " WHERE ", "")}
++	return left, right, leftEnv, rightEnv
++}
++
++func TestSequenceStageAtom(t *testing.T) {
++	for _, count := range []int{1, 31, 32} {
++		t.Run("peers-"+strconv.Itoa(count), func(t *testing.T) {
++			left, right, leftEnv, rightEnv := stagePaths(count)
++			beforeLeft, beforeRight := leftEnv.clone(), rightEnv.clone()
++			got, ok := joinStageAtom(left, right, leftEnv, rightEnv)
++			fact, parsed := parseSQLSequence(got)
++			if count == 32 && ok {
++				t.Fatalf("cap overflow accepted: %+v", got)
++			}
++			if count == 32 {
++				return
++			}
++			if !ok || got.SequenceGuard == nil || len(got.Sequence) != count+1 || got.Sequence[count].Presence != SequenceOptional || got.Sequence[count].Proof.ControlKind != "branch" || got.Sequence[count].Value.Text != "active = ?" || !sequenceShapeSafe(got) || !parsed || fact.Target != "tasks" {
++				t.Fatalf("stage atom count=%d: %+v", count, got)
++			}
++			if reflect.DeepEqual(leftEnv, beforeLeft) == false || reflect.DeepEqual(rightEnv, beforeRight) == false {
++				t.Fatal("stage atom mutated input environment")
++			}
++			got.SequenceGuard.CommonPrefix = "mutated"
++			if left.SequenceGuard.CommonPrefix == "mutated" || right.SequenceGuard.CommonPrefix == "mutated" {
++				t.Fatal("stage atom wrote through input boundary")
++			}
++		})
++	}
++}
++
++func TestSequenceStageRejects(t *testing.T) {
++	cases := []struct {
++		name   string
++		mutate func(*SQLValue, *SQLValue, *valueEnv, *valueEnv)
++	}{
++		{name: "atom", mutate: func(left, right *SQLValue, _ *valueEnv, _ *valueEnv) {
++			right.Sequence[0].Value = exactValue("other = ?")
++		}},
++		{name: "separator", mutate: func(left, right *SQLValue, _ *valueEnv, _ *valueEnv) {
++			right.SequenceSep = ", "
++		}},
++		{name: "source-version", mutate: func(left, right *SQLValue, _ *valueEnv, _ *valueEnv) {
++			left.SequenceGuard.SourceSequenceVersion = 2
++		}},
++		{name: "target-version", mutate: func(left, right *SQLValue, leftEnv, _ *valueEnv) {
++			sequence := leftEnv.sequences["stage"]
++			sequence.version = 2
++			leftEnv.sequences["stage"] = sequence
++		}},
++		{name: "stale-equal", mutate: func(left, right *SQLValue, leftEnv, _ *valueEnv) {
++			sequence := leftEnv.sequences["stage"]
++			sequence.version = 2
++			leftEnv.sequences["stage"] = sequence
++			*right = *left
++		}},
++		{name: "target-binding", mutate: func(left, right *SQLValue, _ *valueEnv, rightEnv *valueEnv) {
++			sequence := rightEnv.sequences["stage"]
++			sequence.binding = types.NewVar(token.NoPos, nil, "other", types.NewSlice(types.Typ[types.String]))
++			rightEnv.sequences["stage"] = sequence
++		}},
++		{name: "boundary-guard", mutate: func(left, right *SQLValue, _ *valueEnv, _ *valueEnv) {
++			right.SequenceGuard.GuardID = "other"
++		}},
++		{name: "guard-cardinality", mutate: func(left, right *SQLValue, leftEnv, _ *valueEnv) {
++			guard := leftEnv.guards["stage"]
++			guard.maxCount = 1
++			leftEnv.guards["stage"] = guard
++		}},
++		{name: "branch", mutate: func(left, right *SQLValue, _ *valueEnv, rightEnv *valueEnv) {
++			branch := rightEnv.branchGuards["stage"]
++			branch.path = branchThen
++			rightEnv.branchGuards["stage"] = branch
++		}},
++		{name: "danger", mutate: func(left, right *SQLValue, _ *valueEnv, _ *valueEnv) {
++			left.SequencePost = " AND x = 'unsafe; DROP'"
++			left.SequenceGuard.CommonSuffix = left.SequencePost
++		}},
++	}
++	for _, test := range cases {
++		t.Run(test.name, func(t *testing.T) {
++			left, right, leftEnv, rightEnv := stagePaths(1)
++			test.mutate(&left, &right, &leftEnv, &rightEnv)
++			_, ok := joinStageAtom(left, right, leftEnv, rightEnv)
++			if ok {
++				t.Fatal("unsafe stage atom accepted")
++			}
++			joined := joinValueAtPaths(left, right, leftEnv, rightEnv, 64)
++			if joined.Kind != Unknown {
++				t.Fatalf("unsafe stage join escaped fail-closed: %+v", joined)
++			}
++		})
++	}
++}
++
++func requireStageUnknown(t *testing.T, body string) {
++	t.Helper()
++	report, err := Analyze(writeFixture(t, stageSource(body)), Options{})
++	if countDiagnostics(report.Diagnostics, "typecheck_error") != 0 {
++		t.Fatalf("typecheck diagnostics=%+v", report.Diagnostics)
++	}
++	if err == nil || len(report.Executions) != 1 || report.Executions[0].Complete || len(report.Diagnostics) != 1 || countDiagnostics(report.Diagnostics, "unknown_sql") != 1 {
++		t.Fatalf("unsafe stage accepted: err=%v executions=%+v diagnostics=%+v", err, report.Executions, report.Diagnostics)
++	}
++}
++
++func TestSequenceStageControl(t *testing.T) {
++	requireStageUnknown(t, `if len(clauses) > 0 || flag {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++`)
++	for name, body := range map[string]string{
++		"mutation": `if len(clauses) > 0 && flag {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++clauses = append(clauses, "owner = ?")
++`,
++		"rebind": `if len(clauses) > 0 && flag {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++clauses = []string{"owner = ?"}
++`,
++	} {
++		t.Run(name, func(t *testing.T) { requireStageUnknown(t, body) })
++	}
++	t.Run("shadow", func(t *testing.T) {
++		requireStageNoReceipt(t, `if flag {
++    clauses := []string{"owner = ?"}
++    if len(clauses) > 0 {
++        query += " WHERE " + strings.Join(clauses, " AND ")
++    }
++}
++if active {
++    if len(clauses) == 0 { query += " WHERE " } else { query += " AND " }
++    query += "active = ?"
++}
++`)
++	})
++	for name, body := range map[string]string{
++		"defer": `defer func() { query += " ORDER BY id" }()
++if len(clauses) > 0 {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++`,
++		"return": `if flag { return }
++if len(clauses) > 0 {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++`,
++	} {
++		t.Run(name, func(t *testing.T) { requireStageNormal(t, body) })
++	}
++}
++
++func requireStageNormal(t *testing.T, body string) {
++	t.Helper()
++	report, err := Analyze(writeFixture(t, stageSource(body)), Options{})
++	if err != nil || len(report.Executions) != 1 || !report.Executions[0].Complete || report.Executions[0].Value.Kind != Template || report.Executions[0].Value.SequenceGuard == nil || !report.Executions[0].Value.SequenceGuard.AllowsEmpty || countDiagnostics(report.Diagnostics, "typecheck_error") != 0 || countDiagnostics(report.Diagnostics, "unknown_sql") != 0 {
++		t.Fatalf("abrupt stage path was merged: err=%v executions=%+v diagnostics=%+v", err, report.Executions, report.Diagnostics)
++	}
++	if strings.Contains(report.Executions[0].Value.String(), "ORDER BY id") {
++		t.Fatal("deferred suffix entered normal execution")
++	}
++}
++
++func requireStageNoReceipt(t *testing.T, body string) {
++	t.Helper()
++	report, err := Analyze(writeFixture(t, stageSource(body)), Options{})
++	if countDiagnostics(report.Diagnostics, "typecheck_error") != 0 || err != nil || len(report.Executions) != 1 {
++		t.Fatalf("shadow stage fixture failed unexpectedly: err=%v executions=%+v diagnostics=%+v", err, report.Executions, report.Diagnostics)
++	}
++	execution := report.Executions[0]
++	if execution.Complete && execution.Value.Kind == Template && execution.Value.SequenceGuard != nil && execution.Value.SequenceGuard.AllowsEmpty {
++		t.Fatalf("shadow stage receipt was accepted: %+v", execution)
++	}
++}
++
++func connectorPaths() (SQLValue, SQLValue, valueEnv, valueEnv) {
++	left, right, leftEnv, rightEnv := stagePaths(1)
++	leftGuard := leftEnv.guards["stage"]
++	leftGuard.path = guardPathNonEmpty
++	leftGuard.minCount, leftGuard.maxCount = 1, -1
++	leftEnv.guards["stage"] = leftGuard
++	rightGuard := rightEnv.guards["stage"]
++	rightGuard.path = guardPathEmpty
++	rightGuard.minCount, rightGuard.maxCount = 0, 0
++	rightEnv.guards["stage"] = rightGuard
++	common := "SELECT id FROM tasks"
++	left.SequencePre = common
++	left.SequencePost = " AND "
++	left.SequenceGuard = &SequenceBoundary{GuardID: "length", GuardKind: "length", SourceSequenceID: "stage", SourceSequenceVersion: 1, CommonPrefix: common, CommonSuffix: " AND ", AllowsEmpty: true, NonEmptyPrefix: " WHERE "}
++	right.SequencePre = common
++	right.SequencePost = " WHERE "
++	right.SequenceGuard = &SequenceBoundary{GuardID: "length", GuardKind: "length", SourceSequenceID: "stage", SourceSequenceVersion: 1, CommonPrefix: common, CommonSuffix: " WHERE ", AllowsEmpty: true, NonEmptyPrefix: " WHERE "}
++	return left, right, leftEnv, rightEnv
++}
++
++func TestSequenceStageConnector(t *testing.T) {
++	left, right, leftEnv, rightEnv := connectorPaths()
++	leftBefore, rightBefore := left, right
++	got, ok := joinStageConnector(left, right, leftEnv, rightEnv)
++	if !ok || got.Kind != Template || got.SequencePre != "SELECT id FROM tasks WHERE " || got.SequencePost != "" || got.SequenceGuard == nil || got.SequenceGuard.GuardID != "guard" {
++		t.Fatalf("connector was not normalized: ok=%t value=%+v", ok, got)
++	}
++	if _, accepted := parseSQLSequence(got); accepted {
++		t.Fatal("pending connector was parsed without outer atom")
++	}
++	if !reflect.DeepEqual(left, leftBefore) || !reflect.DeepEqual(right, rightBefore) {
++		t.Fatal("connector wrote through input values")
++	}
++	reverse, reverseOK := joinStageConnector(right, left, rightEnv, leftEnv)
++	if !reverseOK || !reflect.DeepEqual(got, reverse) {
++		t.Fatalf("connector symmetry failed: forward=%+v reverse=%+v", got, reverse)
++	}
++	wrongEmpty := right
++	wrongEmpty.SequenceGuard = cloneSequenceBoundary(right.SequenceGuard)
++	wrongEmpty.SequencePost = " OR "
++	wrongEmpty.SequenceGuard.CommonSuffix = wrongEmpty.SequencePost
++	if _, accepted := joinStageConnector(left, wrongEmpty, leftEnv, rightEnv); accepted {
++		t.Fatal("wrong empty connector was accepted")
++	}
++	wrongNonempty := left
++	wrongNonempty.SequenceGuard = cloneSequenceBoundary(left.SequenceGuard)
++	wrongNonempty.SequencePost = " OR "
++	wrongNonempty.SequenceGuard.CommonSuffix = wrongNonempty.SequencePost
++	if _, accepted := joinStageConnector(wrongNonempty, right, leftEnv, rightEnv); accepted {
++		t.Fatal("wrong connector was accepted")
++	}
++	nonComplementary := rightEnv.clone()
++	guard := nonComplementary.guards["stage"]
++	guard.path = guardPathNonEmpty
++	guard.minCount, guard.maxCount = 1, -1
++	nonComplementary.guards["stage"] = guard
++	if _, accepted := joinStageConnector(left, right, leftEnv, nonComplementary); accepted {
++		t.Fatal("same-cardinality connector was accepted")
++	}
++	joined := joinValueAtPaths(left, right, leftEnv, nonComplementary, 64)
++	if joined.Kind != Unknown {
++		t.Fatalf("same-cardinality connector escaped fail-closed: %+v", joined)
++	}
++}
++
++func TestSequenceStageCarry(t *testing.T) {
++	left, right, leftEnv, rightEnv := stagePaths(1)
++	left = right
++	got := joinValueAtPaths(left, right, leftEnv, rightEnv, 64)
++	if !equalValue(got, left) {
++		t.Fatalf("valid existing receipt was not carried: got=%+v want=%+v", got, left)
++	}
++	nonComplementary := rightEnv.clone()
++	branch := nonComplementary.branchGuards["stage"]
++	branch.path = branchThen
++	nonComplementary.branchGuards["stage"] = branch
++	got = joinValueAtPaths(left, right, leftEnv, nonComplementary, 64)
++	if !equalValue(got, left) {
++		t.Fatalf("valid equal receipt was rejected: got=%+v want=%+v", got, left)
++	}
++
++	connectorLeft, connectorRight, connectorLeftEnv, connectorRightEnv := connectorPaths()
++	pending, ok := joinStageConnector(connectorLeft, connectorRight, connectorLeftEnv, connectorRightEnv)
++	if !ok {
++		t.Fatal("failed to build pending connector")
++	}
++	joined := joinValueAtPaths(pending, pending, connectorLeftEnv, connectorRightEnv, 64)
++	if joined.Kind != Unknown {
++		t.Fatalf("pending equal connector was carried: %+v", joined)
++	}
++}
++
++func TestSequenceStageNonstageEqual(t *testing.T) {
++	left, right, leftEnv, rightEnv := stagePaths(1)
++	left = right
++	left.SequenceGuard = cloneSequenceBoundary(left.SequenceGuard)
++	right.SequenceGuard = cloneSequenceBoundary(right.SequenceGuard)
++	left.SequenceGuard.AllowsEmpty = false
++	right.SequenceGuard.AllowsEmpty = false
++	got := joinValueAtPaths(left, right, leftEnv, rightEnv, 64)
++	if !equalValue(got, left) {
++		t.Fatalf("nonstage equal template was intercepted: got=%+v want=%+v", got, left)
++	}
++}
++
++func TestSequenceStageAtomNonComplement(t *testing.T) {
++	left, right, leftEnv, rightEnv := stagePaths(1)
++	branch := rightEnv.branchGuards["stage"]
++	branch.path = branchThen
++	rightEnv.branchGuards["stage"] = branch
++	joined := joinValueAtPaths(left, right, leftEnv, rightEnv, 64)
++	if joined.Kind != Unknown {
++		t.Fatalf("same-branch atom escaped fail-closed: %+v", joined)
++	}
++}
++
++func TestSequenceStageValueCOW(t *testing.T) {
++	shared := &SequenceBoundary{GuardID: "guard", GuardKind: "length", SourceSequenceID: "stage", SourceSequenceVersion: 1, AllowsEmpty: false}
++	value := SQLValue{Kind: Template, Sequence: []SequenceAtom{{Value: exactValue("status = ?"), Presence: SequenceRequired, MinCount: 1, MaxCount: 1}}, SequenceID: "stage", SequenceVersion: 1, SequenceSep: " AND ", SequenceGuard: shared}
++	before := *shared
++	env := newEnv()
++	envBefore := env.clone()
++	got := (&analyzer{}).combineSequenceTemplate(nil, nil, exactValue("SELECT id FROM tasks"), value, env)
++	if got.SequenceGuard == shared || !reflect.DeepEqual(*shared, before) {
++		t.Fatalf("sequence template did not clone boundary: got=%+v shared=%+v", got.SequenceGuard, shared)
++	}
++	if !reflect.DeepEqual(env, envBefore) {
++		t.Fatal("sequence template mutated input environment")
++	}
++}
++
++func TestSequenceStageBranches(t *testing.T) {
++	binding := types.NewVar(token.NoPos, nil, "clauses", types.NewSlice(types.Typ[types.String]))
++	selected := newEnv()
++	selected.sequences["stage"] = sequenceState{id: "stage", version: 1, binding: binding}
++	selected.branchGuards["stage"] = branchState{id: "parent", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchThen}
++	parents := snapshotIfBranches(selected)
++	original := selected.branchGuards["stage"]
++	selected.branchGuards["stage"] = branchState{id: "mutated", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchElse}
++	if parents["stage"].id != "parent" || parents["stage"].path != branchThen {
++		t.Fatal("parent branch snapshot shared the selected map")
++	}
++	selected.branchGuards["stage"] = original
++	child := selected.clone()
++	child.branchGuards["stage"] = branchState{id: "inner", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchUnknown}
++	exits := restoreIfBranches([]typedExit{normalExit(child)}, parents)
++	if exits[0].env.branchGuards["stage"].id != "parent" || exits[0].env.branchGuards["stage"].path != branchThen {
++		t.Fatalf("parent branch was not restored: %+v", exits[0].env.branchGuards)
++	}
++	if child.branchGuards["stage"].id != "inner" {
++		t.Fatal("branch restore wrote through child env")
++	}
++	missing := selected.clone()
++	delete(missing.branchGuards, "stage")
++	missingExit := restoreIfBranches([]typedExit{normalExit(missing)}, parents)
++	if _, ok := missingExit[0].env.branchGuards["stage"]; ok {
++		t.Fatal("missing current branch was revived")
++	}
++	active := selected.clone()
++	active.branchGuards["stage"] = branchState{id: "inner", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchElse}
++	activeExit := restoreIfBranches([]typedExit{normalExit(active)}, parents)
++	if activeExit[0].env.branchGuards["stage"].id != "inner" || activeExit[0].env.branchGuards["stage"].path != branchElse {
++		t.Fatal("active child branch was overwritten")
++	}
++	invalid := selected.clone()
++	invalid.branchGuards["stage"] = branchState{id: "parent", sequenceID: "stage", sequenceVersion: 1, binding: binding, path: branchUnknown}
++	invalidParents := snapshotIfBranches(invalid)
++	invalidExit := restoreIfBranches([]typedExit{normalExit(invalid)}, invalidParents)
++	if invalidExit[0].env.branchGuards["stage"].path != branchUnknown {
++		t.Fatal("invalid parent branch was restored")
++	}
++	same := selected.clone()
++	sameExit := restoreIfBranches([]typedExit{normalExit(same)}, parents)
++	if sameExit[0].env.branchGuards["stage"].id != "parent" || sameExit[0].env.branchGuards["stage"].path != branchThen {
++		t.Fatal("same parent branch was rewritten")
++	}
++	abrupt := child.clone()
++	abruptExit := restoreIfBranches([]typedExit{{kind: exitReturn, env: abrupt}}, parents)
++	if abruptExit[0].env.branchGuards["stage"].id != "inner" || abruptExit[0].env.branchGuards["stage"].path != branchUnknown {
++		t.Fatal("abrupt branch was restored")
++	}
++}
++
++func stageSource(body string) string {
++	return `package main
++import ("database/sql"; "strings")
++var _ = strings.TrimSpace
++var external string
++func run(db *sql.DB, input string, flag, active bool) {
++    query := "SELECT id FROM tasks"
++    clauses := make([]string, 0)
++    if flag { clauses = append(clauses, "status = ?") }
++` + body + `    db.Query(query)
++}
++func main() { db, _ := sql.Open("", ""); run(db, external, false, false) }
++`
++}
++
++func TestSequenceStageDangerousAtom(t *testing.T) {
++	for _, atom := range []string{"x; DROP TABLE tasks", "x -- comment", "x /* comment */", "x UNION SELECT id FROM users", "x FROM users", "x RETURNING id"} {
++		t.Run(strings.ReplaceAll(atom, " ", "_"), func(t *testing.T) {
++			report, err := Analyze(writeFixture(t, stageSource(`if len(clauses) > 0 && flag {
++    query += " WHERE " + strings.Join(clauses, " AND ")
++}
++query += "`+atom+`"
++`)), Options{})
++			if countDiagnostics(report.Diagnostics, "typecheck_error") != 0 {
++				t.Fatalf("typecheck diagnostics=%+v", report.Diagnostics)
++			}
++			if err == nil || len(report.Executions) != 1 || report.Executions[0].Complete || len(report.Diagnostics) != 1 || countDiagnostics(report.Diagnostics, "unknown_sql") != 1 {
++				t.Fatalf("dangerous atom accepted: err=%v execution=%+v diagnostics=%+v", err, report.Executions, report.Diagnostics)
++			}
++		})
++	}
++}
+diff --git a/internal/analysis/sqliteinventory/sequence_value.go b/internal/analysis/sqliteinventory/sequence_value.go
+index d2c4411..7378353 100644
+--- a/internal/analysis/sqliteinventory/sequence_value.go
++++ b/internal/analysis/sqliteinventory/sequence_value.go
+@@ -8,6 +8,8 @@ import (
+ )
+ 
+ func (a *analyzer) combineSequenceTemplate(leftExpr, rightExpr ast.Expr, left, right SQLValue, env valueEnv) SQLValue {
++	left.SequenceGuard = cloneSequenceBoundary(left.SequenceGuard)
++	right.SequenceGuard = cloneSequenceBoundary(right.SequenceGuard)
+ 	if left.NumericTail != nil || right.NumericTail != nil {
+ 		if len(left.Sequence) > 0 && right.NumericTail != nil && left.NumericTail == nil && right.Kind == Template {
+ 			sequence, sequenceOK := sequenceByID(env, left.SequenceID)
